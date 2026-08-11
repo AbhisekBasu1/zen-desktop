@@ -17,6 +17,27 @@ const MAX_THREADS = 50;
 const THREAD_MIN_NODES = 3;
 const THREAD_MIN_SPAN_MS = 5 * 60 * 1000;
 
+// Apps are not pages (idea1 §8): they never belong inside a thread.
+const APP_SEED_HOSTS = new Set([
+  "mail.google.com",
+  "calendar.google.com",
+  "gmail.com",
+  "outlook.live.com",
+  "outlook.office.com",
+  "app.slack.com",
+  "discord.com",
+  "web.whatsapp.com",
+  "web.telegram.org",
+  "teams.microsoft.com",
+  "open.spotify.com",
+  "music.youtube.com",
+  "netflix.com",
+  "chatgpt.com",
+  "claude.ai",
+  "messenger.com",
+]);
+const APP_MIN_DAYS = 6; // hosts used on this many distinct days become app-like
+
 /**
  * Process-wide storage and inference for Threads.
  *
@@ -393,6 +414,7 @@ export const ZenThreadsStorage = new (class {
 
     // Fold the log into per-tab node state.
     const nodes = new Map(); // key -> node
+    const hostDays = new Map(); // host -> Set(day) for app detection
     const nodeFor = key => {
       let node = nodes.get(key);
       if (!node) {
@@ -442,6 +464,17 @@ export const ZenThreadsStorage = new (class {
           node.closed = false;
           if (url) {
             node.url = url;
+            try {
+              const host = new URL(url).hostname.replace(/^www\./, "");
+              let days = hostDays.get(host);
+              if (!days) {
+                days = new Set();
+                hostDays.set(host, days);
+              }
+              days.add(Math.floor(ts / 86400000));
+            } catch (e) {
+              // Unparseable URL; ignore for app stats.
+            }
           }
           if (title) {
             node.title = title;
@@ -464,9 +497,34 @@ export const ZenThreadsStorage = new (class {
       }
     }
 
-    // Link children; find each node's component root.
+    // Mark app nodes: they live outside the thread model entirely.
+    const isAppHost = host =>
+      APP_SEED_HOSTS.has(host) ||
+      (hostDays.get(host)?.size ?? 0) >= APP_MIN_DAYS;
     for (const node of nodes.values()) {
-      if (node.parent && nodes.has(node.parent)) {
+      if (node.url) {
+        try {
+          node.isApp = isAppHost(
+            new URL(node.url).hostname.replace(/^www\./, "")
+          );
+        } catch (e) {
+          node.isApp = false;
+        }
+      }
+    }
+
+    // Link children; find each node's component root. App nodes neither
+    // parent nor join anything.
+    for (const node of nodes.values()) {
+      if (node.isApp) {
+        node.parent = null;
+        continue;
+      }
+      if (
+        node.parent &&
+        nodes.has(node.parent) &&
+        !nodes.get(node.parent).isApp
+      ) {
         nodes.get(node.parent).children.push(node);
       } else {
         node.parent = null;
@@ -485,6 +543,9 @@ export const ZenThreadsStorage = new (class {
     // Group into components keyed by root.
     const components = new Map(); // rootKey -> {root, members, lastTs, firstTs}
     for (const node of nodes.values()) {
+      if (node.isApp) {
+        continue;
+      }
       const root = rootOf(node);
       let comp = components.get(root.key);
       if (!comp) {
