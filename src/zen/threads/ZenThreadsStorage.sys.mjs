@@ -8,7 +8,9 @@ ChromeUtils.defineESModuleGetters(lazy, {
   AsyncShutdown: "resource://gre/modules/AsyncShutdown.sys.mjs",
 });
 
-const SNAPSHOT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const SNAPSHOT_WINDOW_MS = 120 * 24 * 60 * 60 * 1000; // wide, so threads age out whole
+const RECEDE_MS = 48 * 60 * 60 * 1000; // inactive 48h -> receded
+const ARCHIVE_MS = 14 * 24 * 60 * 60 * 1000; // inactive 14d -> archived
 const MAX_THREADS = 50;
 // A provenance component only becomes a visible thread once it has enough
 // substance — quick lookups must never create structure (idea1 §17).
@@ -89,6 +91,13 @@ export const ZenThreadsStorage = new (class {
           title TEXT
         )
       `);
+      for (const col of ["status TEXT", "status_ts INTEGER"]) {
+        try {
+          await db.execute(`ALTER TABLE thread_meta ADD COLUMN ${col}`);
+        } catch (e) {
+          // Column already exists.
+        }
+      }
       this.#db = db;
       this.#shutdownBlocker = async () => {
         await this.#writeQueue;
@@ -302,8 +311,8 @@ export const ZenThreadsStorage = new (class {
       }
       try {
         await this.#db.execute(
-          `INSERT OR REPLACE INTO thread_meta (thread_id, title)
-           VALUES (:threadId, :title)`,
+          `INSERT INTO thread_meta (thread_id, title) VALUES (:threadId, :title)
+           ON CONFLICT(thread_id) DO UPDATE SET title = :title`,
           { threadId, title }
         );
       } catch (e) {
@@ -312,23 +321,43 @@ export const ZenThreadsStorage = new (class {
     });
   }
 
-  async #getTitleOverrides() {
+  setThreadStatus(threadId, status) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT INTO thread_meta (thread_id, status, status_ts)
+           VALUES (:threadId, :status, :ts)
+           ON CONFLICT(thread_id) DO UPDATE SET status = :status, status_ts = :ts`,
+          { threadId, status: status ?? null, ts: Date.now() }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setThreadStatus failed", e);
+      }
+    });
+  }
+
+  async #getThreadMeta() {
     const map = new Map();
     if (!this.#db) {
       return map;
     }
     try {
       const rows = await this.#db.execute(
-        "SELECT thread_id, title FROM thread_meta"
+        "SELECT thread_id, title, status, status_ts FROM thread_meta"
       );
       for (const row of rows) {
-        map.set(
-          row.getResultByName("thread_id"),
-          row.getResultByName("title")
-        );
+        map.set(row.getResultByName("thread_id"), {
+          title: row.getResultByName("title"),
+          status: row.getResultByName("status"),
+          statusTs: row.getResultByName("status_ts"),
+        });
       }
     } catch (e) {
-      console.error("ZenThreadsStorage: title overrides failed", e);
+      console.error("ZenThreadsStorage: thread meta failed", e);
     }
     return map;
   }
@@ -483,13 +512,25 @@ export const ZenThreadsStorage = new (class {
       });
     }
 
-    const overrides = await this.#getTitleOverrides();
+    const meta = await this.#getThreadMeta();
+    const now = Date.now();
     for (const thread of threads) {
-      const override = overrides.get(thread.id);
-      if (override) {
-        thread.title = override;
+      const m = meta.get(thread.id);
+      if (m?.title) {
+        thread.title = m.title;
         thread.isSearch = false;
       }
+      // Lifecycle tier. Fresh activity always reactivates a done thread.
+      const done = m?.status === "done" && (m.statusTs ?? 0) >= thread.lastTs;
+      const age = now - thread.lastTs;
+      thread.done = done;
+      thread.tier = done
+        ? "archived"
+        : age > ARCHIVE_MS
+          ? "archived"
+          : age > RECEDE_MS
+            ? "receded"
+            : "recent";
     }
 
     threads.sort((a, b) => b.lastTs - a.lastTs);

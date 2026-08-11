@@ -48,6 +48,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #sidebarEl = null;
   #sidebarRefreshTimer = null;
   #expandedSidebarThreads = new Set();
+  #showArchived = false;
 
   init() {
     try {
@@ -380,8 +381,62 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       return;
     }
 
+    const recent = [];
+    const receded = [];
+    const archived = [];
     for (const thread of threads) {
+      if (thread.tier !== "archived" && this.#containsLive(thread.roots, liveTabs)) {
+        recent.push(thread);
+      } else if (thread.tier === "recent") {
+        recent.push(thread);
+      } else if (thread.tier === "receded") {
+        receded.push(thread);
+      } else {
+        archived.push(thread);
+      }
+    }
+
+    for (const thread of recent) {
       content.appendChild(this.#renderThread(thread, liveTabs, checkpoints));
+    }
+
+    if (receded.length) {
+      const group = document.createElementNS(XHTML_NS, "div");
+      group.className = "zen-thread-section zen-threads-earlier collapsed";
+      const header = document.createElementNS(XHTML_NS, "div");
+      header.className = "zen-thread-header zen-thread-loose-header";
+      header.textContent = `Earlier · ${receded.length}`;
+      header.addEventListener("click", () =>
+        group.classList.toggle("collapsed")
+      );
+      group.appendChild(header);
+      const body = document.createElementNS(XHTML_NS, "div");
+      body.className = "zen-thread-body";
+      for (const thread of receded) {
+        body.appendChild(this.#renderThread(thread, liveTabs, checkpoints));
+      }
+      group.appendChild(body);
+      content.appendChild(group);
+    }
+
+    if (archived.length) {
+      const toggle = document.createElementNS(XHTML_NS, "div");
+      toggle.className = "zen-threads-archived-toggle";
+      toggle.textContent = this.#showArchived
+        ? "Hide archived"
+        : `Show archived · ${archived.length}`;
+      toggle.addEventListener("click", () => {
+        this.#showArchived = !this.#showArchived;
+        this.#render().catch(() => {});
+      });
+      content.appendChild(toggle);
+      if (this.#showArchived) {
+        for (const thread of archived) {
+          content.appendChild(
+            this.#renderThread(thread, liveTabs, checkpoints)
+          );
+        }
+      }
     }
 
     const liveLoose = loose.filter(n => liveTabs.has(n.key));
@@ -526,6 +581,31 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       (gBrowser.tabGroups || []).find(
         g => g.id === folderId && g.isZenFolder
       );
+    const done = document.createElementNS(XHTML_NS, "span");
+    done.className = "zen-thread-done-btn";
+    done.textContent = thread.done ? "↺" : "✓";
+    done.title = thread.done
+      ? "Restore this thread"
+      : "Done — archive thread and close its tabs";
+    done.addEventListener("click", e => {
+      e.stopPropagation();
+      if (thread.done) {
+        ZenThreadsStorage.setThreadStatus(thread.id, null);
+      } else {
+        ZenThreadsStorage.setThreadStatus(thread.id, "done");
+        for (const t of liveThreadTabs) {
+          try {
+            gBrowser.removeTab(t, { animate: true });
+          } catch (err) {
+            // Tab already gone.
+          }
+        }
+      }
+      this.#queueSidebarRefresh();
+      setTimeout(() => this.#render().catch(() => {}), 150);
+    });
+    header.appendChild(done);
+
     if (folder) {
       const badge = document.createElementNS(XHTML_NS, "span");
       badge.className = "zen-thread-folder-badge";
@@ -833,7 +913,15 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     header.textContent = "Threads";
     el.appendChild(header);
 
-    for (const thread of threads.slice(0, 6)) {
+    const visible = threads
+      .filter(t => {
+        if (t.tier === "archived") {
+          return false;
+        }
+        return t.tier === "recent" || this.#containsLive(t.roots, liveTabs);
+      })
+      .slice(0, 6);
+    for (const thread of visible) {
       const hasLive = this.#containsLive(thread.roots, liveTabs);
       const isActive = thread.id === selRoot;
 

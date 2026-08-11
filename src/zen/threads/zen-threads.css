@@ -211,29 +211,65 @@
 /* Compact always-on sidebar section */
 #zen-threads-sidebar {
   margin: 4px 8px 2px;
-  padding: 6px 2px 4px;
+  padding: 8px 2px 6px;
   border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent);
-  font-size: 0.8em;
+  font-size: 13px;
   min-height: 0;
-  max-height: 38vh;
+  max-height: 45vh;
   overflow-y: auto;
+  /* Never let trail content dictate the sidebar's width. */
+  contain: inline-size;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-x: hidden;
+}
+
+#zen-threads-sidebar .zen-thread-node,
+#zen-threads-sidebar .zen-thread-row,
+#zen-threads-sidebar .zen-thread-children {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Sidebar trails: compact indent, capped at three levels, titles only. */
+.zen-ts-trail {
+  margin-inline-start: 6px;
+}
+
+.zen-ts-trail .zen-thread-children {
+  margin-inline-start: 8px;
+  padding-inline-start: 3px;
+}
+
+.zen-ts-trail
+  .zen-thread-children
+  .zen-thread-children
+  .zen-thread-children {
+  margin-inline-start: 0;
+  border-inline-start: none;
+  padding-inline-start: 0;
+}
+
+.zen-ts-trail .zen-thread-url {
+  display: none;
 }
 
 .zen-ts-header {
   opacity: 0.5;
   font-weight: 600;
-  font-size: 0.85em;
+  font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  padding: 2px 6px 4px;
+  padding: 2px 6px 5px;
 }
 
 .zen-ts-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 6px;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
   cursor: default;
   min-width: 0;
   opacity: 0.55;
@@ -253,8 +289,8 @@
 }
 
 .zen-ts-dot {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: currentColor;
   opacity: 0.3;
@@ -276,15 +312,15 @@
 
 .zen-ts-time {
   opacity: 0.5;
-  font-size: 0.85em;
+  font-size: 11px;
   flex-shrink: 0;
 }
 
 .zen-ts-checkpoint {
-  padding: 0 6px 3px 18px;
+  padding: 0 8px 4px 23px;
   opacity: 0.55;
   font-style: italic;
-  font-size: 0.85em;
+  font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -298,4 +334,47 @@
 
 .zen-ts-shelf {
   margin-top: 3px;
+}
+
+.zen-thread-done-btn {
+  flex-shrink: 0;
+  margin-inline-start: 6px;
+  padding: 0 6px;
+  border-radius: 6px;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.zen-thread-header:hover .zen-thread-done-btn {
+  opacity: 0.6;
+}
+
+.zen-thread-done-btn:hover {
+  opacity: 1 !important;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.zen-threads-earlier > .zen-thread-header {
+  opacity: 0.6;
+}
+
+.zen-threads-archived-toggle {
+  margin-top: 6px;
+  padding: 4px 6px;
+  font-size: 0.85em;
+  opacity: 0.45;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.zen-threads-archived-toggle:hover {
+  opacity: 0.8;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+
+.zen-thread-row,
+.zen-ts-row,
+.zen-thread-section {
+  transition: opacity 0.2s ease, background 0.15s ease;
 }
