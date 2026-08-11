@@ -4,14 +4,23 @@
 
 import { nsZenDOMOperatedFeature } from "chrome://browser/content/zen-components/ZenCommonUtils.mjs";
 
+// Process-wide singleton: all windows share one storage/inference instance.
+const { ZenThreadsStorage } = ChromeUtils.importESModule(
+  "chrome://browser/content/zen-components/ZenThreadsStorage.sys.mjs"
+);
+
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
-  Sqlite: "resource://gre/modules/Sqlite.sys.mjs",
+  SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
 });
 
 // browser.xhtml is a XUL document: bare createElement() would produce XUL
 // elements whose text content does not render. Always create HTML elements.
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
+
+// SessionStore custom value carrying a tab's stable thread key, so trails
+// survive session restore.
+const TAB_KEY_PROP = "zenThreadKey";
 
 // Hosts recognized as search result pages, with their query params.
 const SEARCH_ENGINES = [
@@ -25,27 +34,16 @@ const SEARCH_ENGINES = [
 ];
 
 /**
- * Threads spike 1: navigation provenance capture.
- *
- * Records which tab spawned which tab (opener chains) and every top-level
- * navigation, into an in-memory model rendered as a live trail panel
- * (Cmd/Ctrl+Shift+Y) and an append-only SQLite log (zen-threads.sqlite in
- * the profile) that later phases — Threads, episodic history, Compare —
- * will build on.
+ * Per-window Threads feature: captures provenance events into the shared
+ * ZenThreadsStorage and renders the trail panel (Ctrl+Shift+Y).
  */
 class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #tabKeys = new WeakMap(); // tab element -> stable key
-  #parents = new Map(); // tabKey -> parent tabKey
-  #lastInfo = new Map(); // tabKey -> { url, title, isSearch, query, closed }
-  #liveTabs = new Map(); // tabKey -> tab element
-  #db = null;
-  #dbReady = null;
-  #writeQueue = Promise.resolve();
   #progressListener = null;
+  #pendingReopenParent = null; // parent key for a panel-initiated reopen
 
   init() {
     try {
-      this.#dbReady = this.#openDb();
       window.addEventListener("unload", this, { once: true });
       // gBrowser does not exist yet at DOMContentLoaded — wait for the
       // window's delayed startup before touching tabs.
@@ -76,6 +74,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
       window.addEventListener("TabOpen", this);
       window.addEventListener("TabClose", this);
+      window.addEventListener("SSTabRestoring", this);
       window.addEventListener("keydown", this, true);
       this.#progressListener = {
         onLocationChange: (browser, webProgress, request, location, flags) => {
@@ -109,20 +108,46 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       switch (event.type) {
         case "TabOpen": {
           const tab = event.target;
-          this.#registerTab(tab, tab.openerTab ?? null, "open");
+          const parentOverride = this.#pendingReopenParent;
+          this.#pendingReopenParent = null;
+          this.#registerTab(
+            tab,
+            tab.openerTab ?? null,
+            "open",
+            parentOverride
+          );
           break;
         }
         case "TabClose": {
           const tab = event.target;
           const key = this.#tabKeys.get(tab);
           if (key) {
-            const info = this.#lastInfo.get(key);
-            if (info) {
-              info.closed = true;
-              info.title = tab.label || info.title;
-            }
-            this.#liveTabs.delete(key);
-            this.#write("close", key, null, info?.url, tab.label, null);
+            ZenThreadsStorage.recordEvent(
+              "close",
+              key,
+              null,
+              tab.linkedBrowser?.currentURI?.spec ?? null,
+              tab.label,
+              null
+            );
+          }
+          break;
+        }
+        case "SSTabRestoring": {
+          // A restored tab carries its key from the previous session; adopt
+          // it so the trail continues instead of forking.
+          const tab = event.target;
+          const stored = this.#storedKey(tab);
+          if (stored && this.#tabKeys.get(tab) !== stored) {
+            this.#tabKeys.set(tab, stored);
+            ZenThreadsStorage.recordEvent(
+              "restore",
+              stored,
+              null,
+              tab.linkedBrowser?.currentURI?.spec ?? null,
+              tab.label,
+              null
+            );
           }
           break;
         }
@@ -148,7 +173,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           break;
         }
         case "unload": {
-          this.#shutdown();
+          try {
+            if (this.#progressListener) {
+              gBrowser.removeTabsProgressListener(this.#progressListener);
+            }
+          } catch (e) {
+            // Window teardown; nothing useful to do.
+          }
           break;
         }
       }
@@ -163,8 +194,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       return;
     }
     if (panel.hidden) {
-      this.#render();
       panel.hidden = false;
+      this.#render().catch(e =>
+        console.error("ZenThreads: render failed", e)
+      );
     } else {
       panel.hidden = true;
     }
@@ -172,33 +205,39 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
   // -- capture ---------------------------------------------------------------
 
+  #storedKey(tab) {
+    try {
+      return lazy.SessionStore.getCustomTabValue(tab, TAB_KEY_PROP) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   #keyFor(tab) {
     let key = this.#tabKeys.get(tab);
+    if (key) {
+      return key;
+    }
+    key = this.#storedKey(tab);
     if (!key) {
       key = Services.uuid.generateUUID().toString().slice(1, -1);
-      this.#tabKeys.set(tab, key);
+      try {
+        lazy.SessionStore.setCustomTabValue(tab, TAB_KEY_PROP, key);
+      } catch (e) {
+        // Tab may not be trackable yet; the key still works for this session.
+      }
     }
+    this.#tabKeys.set(tab, key);
     return key;
   }
 
-  #registerTab(tab, openerTab, how) {
+  #registerTab(tab, openerTab, how, parentKeyOverride = null) {
     const key = this.#keyFor(tab);
-    this.#liveTabs.set(key, tab);
-    let parentKey = null;
-    if (openerTab) {
+    let parentKey = parentKeyOverride;
+    if (!parentKey && openerTab) {
       parentKey = this.#keyFor(openerTab);
-      this.#parents.set(key, parentKey);
     }
-    if (!this.#lastInfo.has(key)) {
-      this.#lastInfo.set(key, {
-        url: "",
-        title: tab.label || "",
-        isSearch: false,
-        query: null,
-        closed: false,
-      });
-    }
-    this.#write(how, key, parentKey, null, tab.label, null);
+    ZenThreadsStorage.recordEvent(how, key, parentKey, null, tab.label, null);
     const uri = tab.linkedBrowser?.currentURI;
     if (uri && uri.spec && uri.spec !== "about:blank") {
       this.#recordNavigation(tab, uri);
@@ -206,20 +245,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   }
 
   #recordNavigation(tab, uri) {
-    const key = this.#keyFor(tab);
     const spec = uri.spec;
     if (!spec || spec === "about:blank") {
       return;
     }
-    const search = this.#detectSearch(spec);
-    const info = this.#lastInfo.get(key) ?? {};
-    info.url = spec;
-    info.title = tab.label || spec;
-    info.isSearch = !!search;
-    info.query = search;
-    info.closed = false;
-    this.#lastInfo.set(key, info);
-    this.#write("nav", key, this.#parents.get(key) ?? null, spec, tab.label, search);
+    const key = this.#keyFor(tab);
+    const query = this.#detectSearch(spec);
+    ZenThreadsStorage.recordEvent("nav", key, null, spec, tab.label, query);
   }
 
   #detectSearch(spec) {
@@ -241,111 +273,26 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     return null;
   }
 
-  // -- storage ---------------------------------------------------------------
-
-  async #openDb() {
-    try {
-      const path = PathUtils.join(PathUtils.profileDir, "zen-threads.sqlite");
-      const db = await lazy.Sqlite.openConnection({ path });
-      await db.execute(`
-        CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts INTEGER NOT NULL,
-          kind TEXT NOT NULL,
-          tab TEXT NOT NULL,
-          parent TEXT,
-          url TEXT,
-          title TEXT,
-          search_query TEXT
-        )
-      `);
-      this.#db = db;
-    } catch (e) {
-      console.error("ZenThreads: could not open zen-threads.sqlite", e);
-      this.#db = null;
-    }
-  }
-
-  #write(kind, tabKey, parentKey, url, title, query) {
-    this.#writeQueue = this.#writeQueue.then(async () => {
-      await this.#dbReady;
-      if (!this.#db) {
-        return;
-      }
-      try {
-        await this.#db.execute(
-          `INSERT INTO events (ts, kind, tab, parent, url, title, search_query)
-           VALUES (:ts, :kind, :tab, :parent, :url, :title, :query)`,
-          {
-            ts: Date.now(),
-            kind,
-            tab: tabKey,
-            parent: parentKey,
-            url: url ?? null,
-            title: title ?? null,
-            query: query ?? null,
-          }
-        );
-      } catch (e) {
-        console.error("ZenThreads: failed to write event", e);
-      }
-    });
-  }
-
-  #shutdown() {
-    try {
-      if (this.#progressListener) {
-        gBrowser.removeTabsProgressListener(this.#progressListener);
-      }
-    } catch (e) {
-      // Window is going away; nothing useful to do.
-    }
-    this.#writeQueue = this.#writeQueue.then(async () => {
-      if (this.#db) {
-        const db = this.#db;
-        this.#db = null;
-        await db.close().catch(() => {});
-      }
-    });
-  }
-
   // -- rendering -------------------------------------------------------------
 
-  #render() {
+  async #render() {
     const content = document.getElementById("zen-threads-content");
     if (!content) {
       return;
     }
+    const { threads, loose } = await ZenThreadsStorage.getSnapshot();
+
+    const liveTabs = new Map();
+    for (const tab of gBrowser.tabs) {
+      const key = this.#tabKeys.get(tab);
+      if (key) {
+        liveTabs.set(key, tab);
+      }
+    }
+
     content.replaceChildren();
 
-    // Keys worth showing: all live tabs plus closed ancestors of live tabs.
-    const visible = new Set(this.#liveTabs.keys());
-    for (const key of this.#liveTabs.keys()) {
-      let parent = this.#parents.get(key);
-      while (parent && !visible.has(parent)) {
-        if (!this.#lastInfo.has(parent)) {
-          break;
-        }
-        visible.add(parent);
-        parent = this.#parents.get(parent);
-      }
-    }
-
-    const children = new Map();
-    const roots = [];
-    for (const key of visible) {
-      const parent = this.#parents.get(key);
-      if (parent && visible.has(parent)) {
-        if (!children.has(parent)) {
-          children.set(parent, []);
-        }
-        children.get(parent).push(key);
-      } else {
-        roots.push(key);
-      }
-    }
-
-    if (!roots.length) {
+    if (!threads.length && !loose.length) {
       const empty = document.createElementNS(XHTML_NS, "div");
       empty.className = "zen-threads-empty";
       empty.textContent = "No trails yet — browse a little.";
@@ -353,64 +300,164 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       return;
     }
 
-    for (const root of roots) {
-      content.appendChild(this.#renderNode(root, children));
+    for (const thread of threads) {
+      content.appendChild(this.#renderThread(thread, liveTabs));
+    }
+
+    const liveLoose = loose.filter(n => liveTabs.has(n.key));
+    if (liveLoose.length) {
+      const section = document.createElementNS(XHTML_NS, "div");
+      section.className = "zen-thread-section";
+      const header = document.createElementNS(XHTML_NS, "div");
+      header.className = "zen-thread-header zen-thread-loose-header";
+      header.textContent = "Loose tabs";
+      section.appendChild(header);
+      const body = document.createElementNS(XHTML_NS, "div");
+      body.className = "zen-thread-body";
+      for (const node of liveLoose) {
+        body.appendChild(this.#renderNode(node, liveTabs));
+      }
+      section.appendChild(body);
+      content.appendChild(section);
     }
   }
 
-  #renderNode(key, children) {
-    const info = this.#lastInfo.get(key) ?? { title: "(unknown)", url: "" };
-    const tab = this.#liveTabs.get(key);
+  #renderThread(thread, liveTabs) {
+    const hasLive = this.#containsLive(thread.roots, liveTabs);
 
-    const node = document.createElementNS(XHTML_NS, "div");
-    node.className = "zen-thread-node";
+    const section = document.createElementNS(XHTML_NS, "div");
+    section.className = "zen-thread-section";
+    if (!hasLive) {
+      section.classList.add("collapsed");
+    }
 
+    const header = document.createElementNS(XHTML_NS, "div");
+    header.className = "zen-thread-header";
+    const title = document.createElementNS(XHTML_NS, "span");
+    title.className = "zen-thread-title";
+    title.textContent = thread.isSearch
+      ? `\u{1F50D} ${thread.title}`
+      : thread.title;
+    header.appendChild(title);
+    const meta = document.createElementNS(XHTML_NS, "span");
+    meta.className = "zen-thread-meta";
+    meta.textContent = this.#relativeTime(thread.lastTs);
+    header.appendChild(meta);
+    header.addEventListener("click", () => {
+      section.classList.toggle("collapsed");
+    });
+    section.appendChild(header);
+
+    const body = document.createElementNS(XHTML_NS, "div");
+    body.className = "zen-thread-body";
+    for (const root of thread.roots) {
+      body.appendChild(this.#renderNode(root, liveTabs));
+    }
+    section.appendChild(body);
+    return section;
+  }
+
+  #containsLive(nodes, liveTabs) {
+    for (const node of nodes) {
+      if (liveTabs.has(node.key)) {
+        return true;
+      }
+      if (node.children.length && this.#containsLive(node.children, liveTabs)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  #renderNode(node, liveTabs) {
+    const container = document.createElementNS(XHTML_NS, "div");
+    container.className = "zen-thread-node";
+
+    const live = liveTabs.get(node.key);
     const row = document.createElementNS(XHTML_NS, "div");
     row.className = "zen-thread-row";
-    if (!tab) {
+    if (!live) {
       row.classList.add("zen-thread-closed");
     }
-    if (info.isSearch) {
+    if (node.isSearch) {
       row.classList.add("zen-thread-search");
     }
 
     const title = document.createElementNS(XHTML_NS, "span");
     title.className = "zen-thread-title";
-    if (info.isSearch && info.query) {
-      title.textContent = `\u{1F50D} ${info.query}`;
+    if (node.isSearch && node.query) {
+      title.textContent = `\u{1F50D} ${node.query}`;
     } else {
-      title.textContent = (tab ? tab.label : info.title) || info.url || "(empty)";
+      title.textContent =
+        (live ? live.label : node.title) || node.url || "(empty)";
     }
     row.appendChild(title);
 
-    if (!info.isSearch && info.url) {
+    if (!node.isSearch && node.url) {
       const url = document.createElementNS(XHTML_NS, "span");
       url.className = "zen-thread-url";
       try {
-        url.textContent = new URL(info.url).hostname;
+        url.textContent = new URL(node.url).hostname;
       } catch (e) {
-        url.textContent = info.url;
+        url.textContent = node.url;
       }
       row.appendChild(url);
     }
 
-    if (tab) {
-      row.addEventListener("click", () => {
-        gBrowser.selectedTab = tab;
-      });
-    }
-    node.appendChild(row);
-
-    const kids = children.get(key);
-    if (kids?.length) {
-      const container = document.createElementNS(XHTML_NS, "div");
-      container.className = "zen-thread-children";
-      for (const kid of kids) {
-        container.appendChild(this.#renderNode(kid, children));
+    row.addEventListener("click", () => {
+      if (live) {
+        gBrowser.selectedTab = live;
+      } else if (node.url) {
+        this.#reopen(node);
       }
-      node.appendChild(container);
+    });
+    container.appendChild(row);
+
+    if (node.children.length) {
+      const children = document.createElementNS(XHTML_NS, "div");
+      children.className = "zen-thread-children";
+      for (const child of node.children) {
+        children.appendChild(this.#renderNode(child, liveTabs));
+      }
+      container.appendChild(children);
     }
-    return node;
+    return container;
+  }
+
+  #reopen(node) {
+    try {
+      // The TabOpen handler consumes this so the reopened page becomes a
+      // child of the ghost node and stays inside its thread.
+      this.#pendingReopenParent = node.key;
+      const tab = gBrowser.addTab(node.url, {
+        triggeringPrincipal:
+          Services.scriptSecurityManager.getSystemPrincipal(),
+      });
+      gBrowser.selectedTab = tab;
+      this.#render().catch(() => {});
+    } catch (e) {
+      this.#pendingReopenParent = null;
+      console.error("ZenThreads: reopen failed", e);
+    }
+  }
+
+  #relativeTime(ts) {
+    if (!ts) {
+      return "";
+    }
+    const delta = Date.now() - ts;
+    const minutes = Math.round(delta / 60000);
+    if (minutes < 1) {
+      return "now";
+    }
+    if (minutes < 60) {
+      return `${minutes}m`;
+    }
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) {
+      return `${hours}h`;
+    }
+    return `${Math.round(hours / 24)}d`;
   }
 }
 
