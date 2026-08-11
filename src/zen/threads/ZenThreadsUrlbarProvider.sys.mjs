@@ -33,7 +33,7 @@ class ZenThreadsUrlbarProvider extends UrlbarProvider {
     return UrlbarUtils.PROVIDER_TYPE.PROFILE;
   }
 
-  isActive(queryContext) {
+  async isActive(queryContext) {
     return (
       !queryContext.searchMode &&
       queryContext.trimmedSearchString.length >= 2
