@@ -207,3 +207,95 @@
   opacity: 1;
   background: color-mix(in srgb, currentColor 12%, transparent);
 }
+
+/* Compact always-on sidebar section */
+#zen-threads-sidebar {
+  margin: 4px 8px 2px;
+  padding: 6px 2px 4px;
+  border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  font-size: 0.8em;
+  min-height: 0;
+  max-height: 38vh;
+  overflow-y: auto;
+}
+
+.zen-ts-header {
+  opacity: 0.5;
+  font-weight: 600;
+  font-size: 0.85em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 6px 4px;
+}
+
+.zen-ts-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: default;
+  min-width: 0;
+  opacity: 0.55;
+}
+
+.zen-ts-row.live {
+  opacity: 0.95;
+}
+
+.zen-ts-row:hover {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  opacity: 1;
+}
+
+.zen-ts-row.active {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.zen-ts-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.3;
+  flex-shrink: 0;
+}
+
+.zen-ts-row.live > .zen-ts-dot {
+  opacity: 1;
+  background: var(--zen-primary-color, currentColor);
+}
+
+.zen-ts-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.zen-ts-time {
+  opacity: 0.5;
+  font-size: 0.85em;
+  flex-shrink: 0;
+}
+
+.zen-ts-checkpoint {
+  padding: 0 6px 3px 18px;
+  opacity: 0.55;
+  font-style: italic;
+  font-size: 0.85em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.zen-ts-trail {
+  margin: 0 0 4px 10px;
+  border-inline-start: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+  padding-inline-start: 4px;
+}
+
+.zen-ts-shelf {
+  margin-top: 3px;
+}

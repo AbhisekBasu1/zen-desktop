@@ -45,6 +45,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #folderIds = new Set(); // folder ids created from threads (auto-flow)
   #parents = new Map(); // session tabKey -> parent tabKey (root lookup)
   #lastSelected = null; // previously selected tab (checkpoint capture)
+  #sidebarEl = null;
+  #sidebarRefreshTimer = null;
+  #expandedSidebarThreads = new Set();
 
   init() {
     try {
@@ -103,6 +106,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             const tab = gBrowser.getTabForBrowser(browser);
             if (tab) {
               this.#recordNavigation(tab, location);
+              this.#queueSidebarRefresh();
             }
           } catch (e) {
             console.error("ZenThreads: failed to record navigation", e);
@@ -110,6 +114,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         },
       };
       gBrowser.addTabsProgressListener(this.#progressListener);
+      this.#initSidebar();
     } catch (e) {
       console.error("ZenThreads: start failed", e);
     }
@@ -141,6 +146,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
               console.error("ZenThreads: auto-flow failed", e);
             }
           }
+          this.#queueSidebarRefresh();
           break;
         }
         case "TabClose": {
@@ -156,6 +162,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
               null
             );
           }
+          this.#queueSidebarRefresh();
           break;
         }
         case "SSTabRestoring": {
@@ -196,6 +203,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
               }
             }
           }
+          this.#queueSidebarRefresh();
           break;
         }
         case "keydown": {
@@ -767,6 +775,137 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       this.#render().catch(() => {});
     } catch (e) {
       console.error("ZenThreads: grouping failed", e);
+    }
+  }
+
+  #initSidebar() {
+    try {
+      const foot = document.getElementById("zen-sidebar-foot-buttons");
+      if (!foot || !foot.parentNode) {
+        return;
+      }
+      const el = document.createElementNS(XHTML_NS, "div");
+      el.id = "zen-threads-sidebar";
+      foot.parentNode.insertBefore(el, foot);
+      this.#sidebarEl = el;
+      this.#queueSidebarRefresh();
+    } catch (e) {
+      console.error("ZenThreads: sidebar init failed", e);
+    }
+  }
+
+  #queueSidebarRefresh() {
+    if (!this.#sidebarEl) {
+      return;
+    }
+    if (this.#sidebarRefreshTimer) {
+      clearTimeout(this.#sidebarRefreshTimer);
+    }
+    this.#sidebarRefreshTimer = setTimeout(() => {
+      this.#sidebarRefreshTimer = null;
+      this.#refreshSidebar().catch(e =>
+        console.error("ZenThreads: sidebar refresh failed", e)
+      );
+    }, 400);
+  }
+
+  async #refreshSidebar() {
+    const el = this.#sidebarEl;
+    if (!el || !el.isConnected) {
+      return;
+    }
+    const [{ threads }, shelf, checkpoints] = await Promise.all([
+      ZenThreadsStorage.getSnapshot(),
+      ZenThreadsStorage.getShelf(),
+      ZenThreadsStorage.getCheckpoints(),
+    ]);
+    const liveTabs = this.#buildLiveMap();
+    const selKey = this.#tabKeys.get(gBrowser.selectedTab);
+    const selRoot = selKey ? this.#rootKeyOf(selKey) : null;
+
+    el.replaceChildren();
+    if (!threads.length && !shelf.length) {
+      return;
+    }
+
+    const header = document.createElementNS(XHTML_NS, "div");
+    header.className = "zen-ts-header";
+    header.textContent = "Threads";
+    el.appendChild(header);
+
+    for (const thread of threads.slice(0, 6)) {
+      const hasLive = this.#containsLive(thread.roots, liveTabs);
+      const isActive = thread.id === selRoot;
+
+      const row = document.createElementNS(XHTML_NS, "div");
+      row.className = "zen-ts-row";
+      if (hasLive) {
+        row.classList.add("live");
+      }
+      if (isActive) {
+        row.classList.add("active");
+      }
+      const dot = document.createElementNS(XHTML_NS, "span");
+      dot.className = "zen-ts-dot";
+      row.appendChild(dot);
+      const title = document.createElementNS(XHTML_NS, "span");
+      title.className = "zen-ts-title";
+      title.textContent = thread.isSearch
+        ? `\u{1F50D} ${thread.title}`
+        : thread.title;
+      row.appendChild(title);
+      const time = document.createElementNS(XHTML_NS, "span");
+      time.className = "zen-ts-time";
+      time.textContent = this.#relativeTime(thread.lastTs);
+      row.appendChild(time);
+      row.addEventListener("click", () => {
+        if (this.#expandedSidebarThreads.has(thread.id)) {
+          this.#expandedSidebarThreads.delete(thread.id);
+        } else {
+          this.#expandedSidebarThreads.add(thread.id);
+        }
+        this.#refreshSidebar().catch(() => {});
+      });
+      el.appendChild(row);
+
+      const cp = checkpoints.get(thread.id);
+      if (!isActive && cp && (cp.note || cp.lastTitle)) {
+        const line = document.createElementNS(XHTML_NS, "div");
+        line.className = "zen-ts-checkpoint";
+        line.textContent = cp.note
+          ? `↩ next: ${cp.note}`
+          : `↩ ${cp.lastTitle}`;
+        el.appendChild(line);
+      }
+
+      if (this.#expandedSidebarThreads.has(thread.id)) {
+        const trail = document.createElementNS(XHTML_NS, "div");
+        trail.className = "zen-ts-trail";
+        for (const root of thread.roots) {
+          trail.appendChild(this.#renderNode(root, liveTabs));
+        }
+        el.appendChild(trail);
+      }
+    }
+
+    if (shelf.length) {
+      const row = document.createElementNS(XHTML_NS, "div");
+      row.className = "zen-ts-row zen-ts-shelf";
+      const dot = document.createElementNS(XHTML_NS, "span");
+      dot.className = "zen-ts-dot";
+      row.appendChild(dot);
+      const title = document.createElementNS(XHTML_NS, "span");
+      title.className = "zen-ts-title";
+      title.textContent = "Shelf";
+      row.appendChild(title);
+      const count = document.createElementNS(XHTML_NS, "span");
+      count.className = "zen-ts-time";
+      count.textContent = String(shelf.length);
+      row.appendChild(count);
+      row.addEventListener("click", () => {
+        this.togglePanel();
+      });
+      el.appendChild(row);
     }
   }
 
