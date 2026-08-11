@@ -4,4 +4,5 @@
 
         content/browser/zen-components/ZenThreadsManager.mjs                    (../../zen/threads/ZenThreadsManager.mjs)
         content/browser/zen-components/ZenThreadsStorage.sys.mjs                (../../zen/threads/ZenThreadsStorage.sys.mjs)
+        content/browser/zen-components/ZenThreadsUrlbarProvider.sys.mjs         (../../zen/threads/ZenThreadsUrlbarProvider.sys.mjs)
         content/browser/zen-styles/zen-threads.css                              (../../zen/threads/zen-threads.css)

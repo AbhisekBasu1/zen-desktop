@@ -116,6 +116,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       };
       gBrowser.addTabsProgressListener(this.#progressListener);
       this.#initSidebar();
+      // Register the Intent Bar provider (process-wide, idempotent).
+      ChromeUtils.importESModule(
+        "chrome://browser/content/zen-components/ZenThreadsUrlbarProvider.sys.mjs"
+      );
     } catch (e) {
       console.error("ZenThreads: start failed", e);
     }
