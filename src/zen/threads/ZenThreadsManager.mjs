@@ -325,8 +325,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
   #recordNavigation(tab, uri) {
     const spec = uri.spec;
-    if (!spec || spec === "about:blank") {
-      return;
+    if (!spec || !/^https?:/.test(spec)) {
+      return; // only real web navigations belong in trails
     }
     const key = this.#keyFor(tab);
     const query = this.#detectSearch(spec);
@@ -946,6 +946,25 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       time.className = "zen-ts-time";
       time.textContent = this.#relativeTime(thread.lastTs);
       row.appendChild(time);
+      const done = document.createElementNS(XHTML_NS, "span");
+      done.className = "zen-thread-done-btn";
+      done.textContent = "✓";
+      done.title = "Done — archive thread and close its tabs";
+      done.addEventListener("click", e => {
+        e.stopPropagation();
+        ZenThreadsStorage.setThreadStatus(thread.id, "done");
+        const out = [];
+        this.#collectLiveTabs(thread.roots, liveTabs, out);
+        for (const t of out) {
+          try {
+            gBrowser.removeTab(t, { animate: true });
+          } catch (err) {
+            // Tab already gone.
+          }
+        }
+        this.#queueSidebarRefresh();
+      });
+      row.appendChild(done);
       row.addEventListener("click", () => {
         if (this.#expandedSidebarThreads.has(thread.id)) {
           this.#expandedSidebarThreads.delete(thread.id);

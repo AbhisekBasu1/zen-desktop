@@ -434,6 +434,9 @@ export const ZenThreadsStorage = new (class {
           if (title) {
             node.title = title;
           }
+          if (url && !node.url) {
+            node.url = url;
+          }
           break;
         case "nav": {
           node.closed = false;
@@ -453,6 +456,9 @@ export const ZenThreadsStorage = new (class {
           node.closed = false;
           if (title && !node.title) {
             node.title = title;
+          }
+          if (url && !node.url) {
+            node.url = url;
           }
           break;
       }
@@ -495,10 +501,13 @@ export const ZenThreadsStorage = new (class {
     for (const comp of components.values()) {
       const span = comp.lastTs - comp.firstTs;
       const hasSearchRoot = comp.root.isSearch;
+      // Empty new-tab chains must never become threads.
+      const hasContent = comp.members.some(n => /^https?:/.test(n.url));
       const qualifies =
-        hasSearchRoot ||
+        hasContent &&
+        (hasSearchRoot ||
         comp.members.length >= THREAD_MIN_NODES ||
-        span >= THREAD_MIN_SPAN_MS;
+        span >= THREAD_MIN_SPAN_MS);
       if (!qualifies) {
         loose.push(...comp.members.filter(n => !n.parent));
         continue;

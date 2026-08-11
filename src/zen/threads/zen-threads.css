@@ -346,7 +346,8 @@
   transition: opacity 0.15s ease;
 }
 
-.zen-thread-header:hover .zen-thread-done-btn {
+.zen-thread-header:hover .zen-thread-done-btn,
+.zen-ts-row:hover .zen-thread-done-btn {
   opacity: 0.6;
 }
 
