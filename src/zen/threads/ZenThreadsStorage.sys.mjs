@@ -63,6 +63,32 @@ export const ZenThreadsStorage = new (class {
           folder_id TEXT NOT NULL
         )
       `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS shelf (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          url TEXT NOT NULL,
+          title TEXT,
+          tab_key TEXT,
+          resolved_ts INTEGER,
+          restored INTEGER DEFAULT 0
+        )
+      `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS checkpoints (
+          thread_id TEXT PRIMARY KEY,
+          ts INTEGER NOT NULL,
+          note TEXT,
+          last_url TEXT,
+          last_title TEXT
+        )
+      `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS thread_meta (
+          thread_id TEXT PRIMARY KEY,
+          title TEXT
+        )
+      `);
       this.#db = db;
       this.#shutdownBlocker = async () => {
         await this.#writeQueue;
@@ -145,6 +171,164 @@ export const ZenThreadsStorage = new (class {
       }
     } catch (e) {
       console.error("ZenThreadsStorage: getThreadFolders failed", e);
+    }
+    return map;
+  }
+
+  shelvePage(url, title, tabKey) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT INTO shelf (ts, url, title, tab_key)
+           VALUES (:ts, :url, :title, :tabKey)`,
+          { ts: Date.now(), url, title: title ?? null, tabKey: tabKey ?? null }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: shelvePage failed", e);
+      }
+    });
+  }
+
+  resolveShelfItem(id, restored) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `UPDATE shelf SET resolved_ts = :ts, restored = :restored
+           WHERE id = :id`,
+          { ts: Date.now(), restored: restored ? 1 : 0, id }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: resolveShelfItem failed", e);
+      }
+    });
+  }
+
+  async getShelf(limit = 30) {
+    await this.#dbReady;
+    await this.#writeQueue;
+    const items = [];
+    if (!this.#db) {
+      return items;
+    }
+    try {
+      const rows = await this.#db.execute(
+        `SELECT id, ts, url, title FROM shelf
+         WHERE resolved_ts IS NULL ORDER BY ts DESC LIMIT :limit`,
+        { limit }
+      );
+      for (const row of rows) {
+        items.push({
+          id: row.getResultByName("id"),
+          ts: row.getResultByName("ts"),
+          url: row.getResultByName("url"),
+          title: row.getResultByName("title"),
+        });
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: getShelf failed", e);
+    }
+    return items;
+  }
+
+  setCheckpoint(threadId, note, lastUrl, lastTitle) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        // Automatic checkpoints (note = null) refresh position but keep any
+        // typed note; a typed note always wins.
+        await this.#db.execute(
+          `INSERT INTO checkpoints (thread_id, ts, note, last_url, last_title)
+           VALUES (:threadId, :ts, :note, :lastUrl, :lastTitle)
+           ON CONFLICT(thread_id) DO UPDATE SET
+             ts = :ts,
+             note = COALESCE(:note, checkpoints.note),
+             last_url = COALESCE(:lastUrl, checkpoints.last_url),
+             last_title = COALESCE(:lastTitle, checkpoints.last_title)`,
+          {
+            threadId,
+            ts: Date.now(),
+            note: note ?? null,
+            lastUrl: lastUrl ?? null,
+            lastTitle: lastTitle ?? null,
+          }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setCheckpoint failed", e);
+      }
+    });
+  }
+
+  async getCheckpoints() {
+    await this.#dbReady;
+    await this.#writeQueue;
+    const map = new Map();
+    if (!this.#db) {
+      return map;
+    }
+    try {
+      const rows = await this.#db.execute(
+        "SELECT thread_id, ts, note, last_url, last_title FROM checkpoints"
+      );
+      for (const row of rows) {
+        map.set(row.getResultByName("thread_id"), {
+          ts: row.getResultByName("ts"),
+          note: row.getResultByName("note"),
+          lastUrl: row.getResultByName("last_url"),
+          lastTitle: row.getResultByName("last_title"),
+        });
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: getCheckpoints failed", e);
+    }
+    return map;
+  }
+
+  setThreadTitle(threadId, title) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT OR REPLACE INTO thread_meta (thread_id, title)
+           VALUES (:threadId, :title)`,
+          { threadId, title }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setThreadTitle failed", e);
+      }
+    });
+  }
+
+  async #getTitleOverrides() {
+    const map = new Map();
+    if (!this.#db) {
+      return map;
+    }
+    try {
+      const rows = await this.#db.execute(
+        "SELECT thread_id, title FROM thread_meta"
+      );
+      for (const row of rows) {
+        map.set(
+          row.getResultByName("thread_id"),
+          row.getResultByName("title")
+        );
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: title overrides failed", e);
     }
     return map;
   }
@@ -297,6 +481,15 @@ export const ZenThreadsStorage = new (class {
         lastTs: comp.lastTs,
         roots: [comp.root],
       });
+    }
+
+    const overrides = await this.#getTitleOverrides();
+    for (const thread of threads) {
+      const override = overrides.get(thread.id);
+      if (override) {
+        thread.title = override;
+        thread.isSearch = false;
+      }
     }
 
     threads.sort((a, b) => b.lastTs - a.lastTs);

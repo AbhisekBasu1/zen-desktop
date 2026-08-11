@@ -43,6 +43,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #pendingReopenParent = null; // parent key for a panel-initiated reopen
   #folderMap = new Map(); // threadId -> folderId
   #folderIds = new Set(); // folder ids created from threads (auto-flow)
+  #parents = new Map(); // session tabKey -> parent tabKey (root lookup)
+  #lastSelected = null; // previously selected tab (checkpoint capture)
 
   init() {
     try {
@@ -80,8 +82,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           this.#folderIds = new Set(map.values());
         })
         .catch(() => {});
+      this.#lastSelected = gBrowser.selectedTab;
       window.addEventListener("TabOpen", this);
       window.addEventListener("TabClose", this);
+      window.addEventListener("TabSelect", this);
       window.addEventListener("SSTabRestoring", this);
       window.addEventListener("keydown", this, true);
       this.#progressListener = {
@@ -172,7 +176,49 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           }
           break;
         }
+        case "TabSelect": {
+          const prev = this.#lastSelected;
+          const next = event.target;
+          this.#lastSelected = next;
+          if (prev && prev !== next && !prev.closing) {
+            const prevKey = this.#tabKeys.get(prev);
+            const nextKey = this.#tabKeys.get(next);
+            if (prevKey) {
+              const prevRoot = this.#rootKeyOf(prevKey);
+              const nextRoot = nextKey ? this.#rootKeyOf(nextKey) : null;
+              if (prevRoot !== nextRoot) {
+                ZenThreadsStorage.setCheckpoint(
+                  prevRoot,
+                  null,
+                  prev.linkedBrowser?.currentURI?.spec ?? null,
+                  prev.label ?? null
+                );
+              }
+            }
+          }
+          break;
+        }
         case "keydown": {
+          if (
+            event.metaKey &&
+            !event.ctrlKey &&
+            !event.shiftKey &&
+            !event.altKey &&
+            event.key.toLowerCase() === "s"
+          ) {
+            const ae = document.activeElement;
+            if (
+              ae &&
+              (ae.localName === "input" || ae.localName === "textarea")
+            ) {
+              break; // typing in chrome UI — leave Cmd+S alone
+            }
+            if (this.#shelveCurrent()) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+            break;
+          }
           if (
             event.ctrlKey &&
             !event.metaKey &&
@@ -258,6 +304,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!parentKey && openerTab) {
       parentKey = this.#keyFor(openerTab);
     }
+    if (parentKey) {
+      this.#parents.set(key, parentKey);
+    }
     ZenThreadsStorage.recordEvent(how, key, parentKey, null, tab.label, null);
     const uri = tab.linkedBrowser?.currentURI;
     if (uri && uri.spec && uri.spec !== "about:blank") {
@@ -301,19 +350,21 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!content) {
       return;
     }
-    const { threads, loose } = await ZenThreadsStorage.getSnapshot();
+    const [{ threads, loose }, shelf, checkpoints] = await Promise.all([
+      ZenThreadsStorage.getSnapshot(),
+      ZenThreadsStorage.getShelf(),
+      ZenThreadsStorage.getCheckpoints(),
+    ]);
 
-    const liveTabs = new Map();
-    for (const tab of gBrowser.tabs) {
-      const key = this.#tabKeys.get(tab);
-      if (key) {
-        liveTabs.set(key, tab);
-      }
-    }
+    const liveTabs = this.#buildLiveMap();
 
     content.replaceChildren();
 
-    if (!threads.length && !loose.length) {
+    if (shelf.length) {
+      content.appendChild(this.#renderShelf(shelf));
+    }
+
+    if (!threads.length && !loose.length && !shelf.length) {
       const empty = document.createElementNS(XHTML_NS, "div");
       empty.className = "zen-threads-empty";
       empty.textContent = "No trails yet — browse a little.";
@@ -322,7 +373,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
 
     for (const thread of threads) {
-      content.appendChild(this.#renderThread(thread, liveTabs));
+      content.appendChild(this.#renderThread(thread, liveTabs, checkpoints));
     }
 
     const liveLoose = loose.filter(n => liveTabs.has(n.key));
@@ -343,7 +394,96 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
-  #renderThread(thread, liveTabs) {
+  #buildLiveMap() {
+    const map = new Map();
+    for (const win of Services.wm.getEnumerator("navigator:browser")) {
+      if (win.closed || !win.gBrowser) {
+        continue;
+      }
+      for (const tab of win.gBrowser.tabs) {
+        let key = win === window ? this.#tabKeys.get(tab) : null;
+        if (!key) {
+          try {
+            key =
+              lazy.SessionStore.getCustomTabValue(tab, TAB_KEY_PROP) || null;
+          } catch (e) {
+            key = null;
+          }
+        }
+        if (key && !map.has(key)) {
+          map.set(key, { tab, win });
+        }
+      }
+    }
+    return map;
+  }
+
+  #renderShelf(items) {
+    const section = document.createElementNS(XHTML_NS, "div");
+    section.className = "zen-thread-section zen-shelf-section";
+
+    const header = document.createElementNS(XHTML_NS, "div");
+    header.className = "zen-thread-header";
+    const title = document.createElementNS(XHTML_NS, "span");
+    title.className = "zen-thread-title";
+    title.textContent = "Shelf";
+    header.appendChild(title);
+    const meta = document.createElementNS(XHTML_NS, "span");
+    meta.className = "zen-thread-meta";
+    meta.textContent = String(items.length);
+    header.appendChild(meta);
+    header.addEventListener("click", () => {
+      section.classList.toggle("collapsed");
+    });
+    section.appendChild(header);
+
+    const body = document.createElementNS(XHTML_NS, "div");
+    body.className = "zen-thread-body";
+    for (const item of items) {
+      const row = document.createElementNS(XHTML_NS, "div");
+      row.className = "zen-thread-row zen-shelf-row";
+      const rowTitle = document.createElementNS(XHTML_NS, "span");
+      rowTitle.className = "zen-thread-title";
+      rowTitle.textContent = item.title || item.url;
+      row.appendChild(rowTitle);
+      const host = document.createElementNS(XHTML_NS, "span");
+      host.className = "zen-thread-url";
+      try {
+        host.textContent = new URL(item.url).hostname;
+      } catch (e) {
+        host.textContent = "";
+      }
+      row.appendChild(host);
+      const dismiss = document.createElementNS(XHTML_NS, "span");
+      dismiss.className = "zen-shelf-x";
+      dismiss.textContent = "×";
+      dismiss.title = "Remove from shelf";
+      dismiss.addEventListener("click", e => {
+        e.stopPropagation();
+        ZenThreadsStorage.resolveShelfItem(item.id, false);
+        this.#render().catch(() => {});
+      });
+      row.appendChild(dismiss);
+      row.addEventListener("click", () => {
+        try {
+          const tab = gBrowser.addTab(item.url, {
+            triggeringPrincipal:
+              Services.scriptSecurityManager.getSystemPrincipal(),
+          });
+          gBrowser.selectedTab = tab;
+          ZenThreadsStorage.resolveShelfItem(item.id, true);
+          this.#render().catch(() => {});
+        } catch (e) {
+          console.error("ZenThreads: shelf reopen failed", e);
+        }
+      });
+      body.appendChild(row);
+    }
+    section.appendChild(body);
+    return section;
+  }
+
+  #renderThread(thread, liveTabs, checkpoints) {
     const hasLive = this.#containsLive(thread.roots, liveTabs);
 
     const section = document.createElementNS(XHTML_NS, "div");
@@ -359,6 +499,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     title.textContent = thread.isSearch
       ? `\u{1F50D} ${thread.title}`
       : thread.title;
+    title.title = "Double-click to rename";
+    title.addEventListener("dblclick", e => {
+      e.stopPropagation();
+      this.#startRename(thread, header);
+    });
     header.appendChild(title);
     const meta = document.createElementNS(XHTML_NS, "span");
     meta.className = "zen-thread-meta";
@@ -401,11 +546,75 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     const body = document.createElementNS(XHTML_NS, "div");
     body.className = "zen-thread-body";
+
+    const cp = checkpoints?.get(thread.id);
+    if (cp && (cp.note || cp.lastTitle)) {
+      const line = document.createElementNS(XHTML_NS, "div");
+      line.className = "zen-thread-checkpoint";
+      line.textContent = cp.note
+        ? `↩ next: ${cp.note}`
+        : `↩ you were at: ${cp.lastTitle}`;
+      body.appendChild(line);
+    }
+
     for (const root of thread.roots) {
       body.appendChild(this.#renderNode(root, liveTabs));
     }
+
+    const noteInput = document.createElementNS(XHTML_NS, "input");
+    noteInput.className = "zen-thread-note-input";
+    noteInput.placeholder = "next: …";
+    noteInput.addEventListener("keydown", e => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        const value = noteInput.value.trim();
+        if (value) {
+          ZenThreadsStorage.setCheckpoint(thread.id, value, null, null);
+          this.#render().catch(() => {});
+        }
+      }
+    });
+    noteInput.addEventListener("click", e => e.stopPropagation());
+    body.appendChild(noteInput);
+
     section.appendChild(body);
     return section;
+  }
+
+  #startRename(thread, headerEl) {
+    const input = document.createElementNS(XHTML_NS, "input");
+    input.className = "zen-thread-rename-input";
+    input.value = thread.title;
+    const finish = commit => {
+      if (commit) {
+        const value = input.value.trim();
+        if (value && value !== thread.title) {
+          ZenThreadsStorage.setThreadTitle(thread.id, value);
+          const folderId = this.#folderMap.get(thread.id);
+          const folder =
+            folderId &&
+            (gBrowser.tabGroups || []).find(
+              g => g.id === folderId && g.isZenFolder
+            );
+          if (folder) {
+            folder.label = value;
+          }
+        }
+      }
+      this.#render().catch(() => {});
+    };
+    input.addEventListener("keydown", e => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        finish(true);
+      } else if (e.key === "Escape") {
+        finish(false);
+      }
+    });
+    input.addEventListener("click", e => e.stopPropagation());
+    headerEl.replaceChildren(input);
+    input.focus();
+    input.select();
   }
 
   #containsLive(nodes, liveTabs) {
@@ -424,10 +633,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     const container = document.createElementNS(XHTML_NS, "div");
     container.className = "zen-thread-node";
 
-    const live = liveTabs.get(node.key);
+    const entry = liveTabs.get(node.key);
     const row = document.createElementNS(XHTML_NS, "div");
     row.className = "zen-thread-row";
-    if (!live) {
+    if (!entry) {
       row.classList.add("zen-thread-closed");
     }
     if (node.isSearch) {
@@ -440,7 +649,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       title.textContent = `\u{1F50D} ${node.query}`;
     } else {
       title.textContent =
-        (live ? live.label : node.title) || node.url || "(empty)";
+        (entry ? entry.tab.label : node.title) || node.url || "(empty)";
     }
     row.appendChild(title);
 
@@ -456,8 +665,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
 
     row.addEventListener("click", () => {
-      if (live) {
-        gBrowser.selectedTab = live;
+      if (entry) {
+        entry.win.focus();
+        entry.win.gBrowser.selectedTab = entry.tab;
       } else if (node.url) {
         this.#reopen(node);
       }
@@ -494,13 +704,52 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
   #collectLiveTabs(nodes, liveTabs, out) {
     for (const node of nodes) {
-      const tab = liveTabs.get(node.key);
-      if (tab && !tab.pinned && !out.includes(tab)) {
-        out.push(tab);
+      const entry = liveTabs.get(node.key);
+      if (
+        entry &&
+        entry.win === window &&
+        !entry.tab.pinned &&
+        !out.includes(entry.tab)
+      ) {
+        out.push(entry.tab);
       }
       if (node.children.length) {
         this.#collectLiveTabs(node.children, liveTabs, out);
       }
+    }
+  }
+
+  #rootKeyOf(key) {
+    let cur = key;
+    const seen = new Set();
+    while (this.#parents.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      cur = this.#parents.get(cur);
+    }
+    return cur;
+  }
+
+  #shelveCurrent() {
+    try {
+      const tab = gBrowser.selectedTab;
+      const uri = tab?.linkedBrowser?.currentURI;
+      if (!uri || !/^https?$/.test(uri.scheme)) {
+        return false; // let the native Save dialog handle non-web pages
+      }
+      const key = this.#tabKeys.get(tab) ?? null;
+      ZenThreadsStorage.shelvePage(uri.spec, tab.label, key);
+      if (gBrowser.tabs.length > 1) {
+        gBrowser.removeTab(tab, { animate: true });
+      } else {
+        gBrowser.selectedBrowser.fixupAndLoadURIString("about:newtab", {
+          triggeringPrincipal:
+            Services.scriptSecurityManager.getSystemPrincipal(),
+        });
+      }
+      return true;
+    } catch (e) {
+      console.error("ZenThreads: shelve failed", e);
+      return false;
     }
   }
 
