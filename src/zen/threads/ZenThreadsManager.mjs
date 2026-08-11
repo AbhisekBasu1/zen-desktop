@@ -41,6 +41,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #tabKeys = new WeakMap(); // tab element -> stable key
   #progressListener = null;
   #pendingReopenParent = null; // parent key for a panel-initiated reopen
+  #folderMap = new Map(); // threadId -> folderId
+  #folderIds = new Set(); // folder ids created from threads (auto-flow)
 
   init() {
     try {
@@ -72,6 +74,12 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       for (const tab of gBrowser.tabs) {
         this.#registerTab(tab, tab.openerTab ?? null, "seed");
       }
+      ZenThreadsStorage.getThreadFolders()
+        .then(map => {
+          this.#folderMap = map;
+          this.#folderIds = new Set(map.values());
+        })
+        .catch(() => {});
       window.addEventListener("TabOpen", this);
       window.addEventListener("TabClose", this);
       window.addEventListener("SSTabRestoring", this);
@@ -116,6 +124,19 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             "open",
             parentOverride
           );
+          // Auto-flow: a page opened from a grouped thread joins its folder.
+          const openerGroup = tab.openerTab?.group;
+          if (
+            openerGroup?.isZenFolder &&
+            this.#folderIds.has(openerGroup.id)
+          ) {
+            try {
+              gBrowser.pinTab(tab);
+              openerGroup.addTabs([tab]);
+            } catch (e) {
+              console.error("ZenThreads: auto-flow failed", e);
+            }
+          }
           break;
         }
         case "TabClose": {
@@ -343,6 +364,36 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     meta.className = "zen-thread-meta";
     meta.textContent = this.#relativeTime(thread.lastTs);
     header.appendChild(meta);
+
+    const liveThreadTabs = [];
+    this.#collectLiveTabs(thread.roots, liveTabs, liveThreadTabs);
+    const folderId = this.#folderMap.get(thread.id);
+    const folder =
+      folderId &&
+      (gBrowser.tabGroups || []).find(
+        g => g.id === folderId && g.isZenFolder
+      );
+    if (folder) {
+      const badge = document.createElementNS(XHTML_NS, "span");
+      badge.className = "zen-thread-folder-badge";
+      badge.textContent = "\u{1F4C1}";
+      badge.title = "Grouped in sidebar";
+      header.appendChild(badge);
+    } else if (
+      liveThreadTabs.length >= 2 &&
+      typeof gZenFolders !== "undefined"
+    ) {
+      const btn = document.createElementNS(XHTML_NS, "span");
+      btn.className = "zen-thread-group-btn";
+      btn.textContent = "Group";
+      btn.title = "Group this thread's tabs into a sidebar folder";
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#groupThread(thread, liveThreadTabs);
+      });
+      header.appendChild(btn);
+    }
+
     header.addEventListener("click", () => {
       section.classList.toggle("collapsed");
     });
@@ -438,6 +489,35 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     } catch (e) {
       this.#pendingReopenParent = null;
       console.error("ZenThreads: reopen failed", e);
+    }
+  }
+
+  #collectLiveTabs(nodes, liveTabs, out) {
+    for (const node of nodes) {
+      const tab = liveTabs.get(node.key);
+      if (tab && !tab.pinned && !out.includes(tab)) {
+        out.push(tab);
+      }
+      if (node.children.length) {
+        this.#collectLiveTabs(node.children, liveTabs, out);
+      }
+    }
+  }
+
+  #groupThread(thread, tabs) {
+    try {
+      const folder = gZenFolders.createFolder(tabs, {
+        label: thread.title,
+        saveOnWindowClose: true,
+      });
+      if (folder?.id) {
+        this.#folderMap.set(thread.id, folder.id);
+        this.#folderIds.add(folder.id);
+        ZenThreadsStorage.setThreadFolder(thread.id, folder.id);
+      }
+      this.#render().catch(() => {});
+    } catch (e) {
+      console.error("ZenThreads: grouping failed", e);
     }
   }
 

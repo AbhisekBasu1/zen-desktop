@@ -57,6 +57,12 @@ export const ZenThreadsStorage = new (class {
       await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_tab ON events(tab)"
       );
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS thread_folders (
+          thread_id TEXT PRIMARY KEY,
+          folder_id TEXT NOT NULL
+        )
+      `);
       this.#db = db;
       this.#shutdownBlocker = async () => {
         await this.#writeQueue;
@@ -100,6 +106,47 @@ export const ZenThreadsStorage = new (class {
         console.error("ZenThreadsStorage: write failed", e);
       }
     });
+  }
+
+  setThreadFolder(threadId, folderId) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT OR REPLACE INTO thread_folders (thread_id, folder_id)
+           VALUES (:threadId, :folderId)`,
+          { threadId, folderId }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setThreadFolder failed", e);
+      }
+    });
+  }
+
+  async getThreadFolders() {
+    await this.#dbReady;
+    await this.#writeQueue;
+    const map = new Map();
+    if (!this.#db) {
+      return map;
+    }
+    try {
+      const rows = await this.#db.execute(
+        "SELECT thread_id, folder_id FROM thread_folders"
+      );
+      for (const row of rows) {
+        map.set(
+          row.getResultByName("thread_id"),
+          row.getResultByName("folder_id")
+        );
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: getThreadFolders failed", e);
+    }
+    return map;
   }
 
   /**
