@@ -34,10 +34,7 @@ class ZenThreadsUrlbarProvider extends UrlbarProvider {
   }
 
   async isActive(queryContext) {
-    return (
-      !queryContext.searchMode &&
-      queryContext.trimmedSearchString.length >= 2
-    );
+    return queryContext.trimmedSearchString.length >= 2;
   }
 
   getPriority() {
@@ -84,24 +81,18 @@ class ZenThreadsUrlbarProvider extends UrlbarProvider {
         if (added >= MAX_RESULTS) {
           break;
         }
-        if (!thread.title.toLowerCase().includes(query)) {
-          continue;
-        }
+        const matches = thread.title.toLowerCase().includes(query);
         const url = this.#bestUrl(thread);
-        if (!url) {
+        if (!matches || !url) {
           continue;
         }
-        const result = new lazy.UrlbarResult(
-          UrlbarUtils.RESULT_TYPE.URL,
-          UrlbarUtils.RESULT_SOURCE.HISTORY,
-          ...lazy.UrlbarResult.payloadAndSimpleHighlights(
-            queryContext.tokens,
-            {
-              url,
-              title: [`Resume thread: ${thread.title}`, UrlbarUtils.HIGHLIGHT.TYPED],
-            }
-          )
-        );
+        const result = new lazy.UrlbarResult({
+          type: UrlbarUtils.RESULT_TYPE.URL,
+          source: UrlbarUtils.RESULT_SOURCE.HISTORY,
+          payload: { url, title: `Resume thread: ${thread.title}` },
+          highlights: {},
+          suggestedIndex: 1 + added,
+        });
         addCallback(this, result);
         added++;
       }
@@ -114,17 +105,13 @@ class ZenThreadsUrlbarProvider extends UrlbarProvider {
         if (!label.toLowerCase().includes(query)) {
           continue;
         }
-        const result = new lazy.UrlbarResult(
-          UrlbarUtils.RESULT_TYPE.URL,
-          UrlbarUtils.RESULT_SOURCE.HISTORY,
-          ...lazy.UrlbarResult.payloadAndSimpleHighlights(
-            queryContext.tokens,
-            {
-              url: item.url,
-              title: [`Shelf: ${label}`, UrlbarUtils.HIGHLIGHT.TYPED],
-            }
-          )
-        );
+        const result = new lazy.UrlbarResult({
+          type: UrlbarUtils.RESULT_TYPE.URL,
+          source: UrlbarUtils.RESULT_SOURCE.HISTORY,
+          payload: { url: item.url, title: `Shelf: ${label}` },
+          highlights: {},
+          suggestedIndex: 1 + added,
+        });
         addCallback(this, result);
         added++;
       }
