@@ -220,6 +220,35 @@
   background: color-mix(in srgb, currentColor 12%, transparent);
 }
 
+.zen-shelf-affinity {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 999px;
+  opacity: 0.75;
+  background: color-mix(in srgb, var(--zen-primary-color, currentColor) 22%, transparent);
+}
+
+.zen-shelf-row.is-related {
+  background: color-mix(in srgb, var(--zen-primary-color, currentColor) 7%, transparent);
+}
+
+.zen-shelf-row.is-aged .zen-thread-title {
+  opacity: 0.6;
+}
+
+.zen-shelf-receded {
+  margin-block-start: 4px;
+}
+
+.zen-shelf-receded > .zen-thread-header {
+  font-size: 0.85em;
+  opacity: 0.5;
+}
+
 /* Return card: a brief, calm reminder of a suspended intention. */
 #zen-threads-return-card {
   position: fixed;
@@ -559,23 +588,62 @@
 }
 
 .zen-thread-done-btn {
+  -moz-appearance: none;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.6;
   flex-shrink: 0;
   margin-inline-start: 6px;
   padding: 0 6px;
   border-radius: 6px;
   opacity: 0;
   cursor: pointer;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, background 0.15s ease;
 }
 
+/* Reveal on hover, and equally on keyboard focus so the actions are not
+   mouse-only. */
 .zen-thread-header:hover .zen-thread-done-btn,
-.zen-ts-row:hover .zen-thread-done-btn {
+.zen-ts-row:hover .zen-thread-done-btn,
+.zen-thread-header:focus-within .zen-thread-done-btn,
+.zen-ts-row:focus-within .zen-thread-done-btn {
   opacity: 0.6;
 }
 
-.zen-thread-done-btn:hover {
+.zen-thread-done-btn:hover,
+.zen-thread-done-btn:focus-visible {
   opacity: 1 !important;
   background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.zen-shelf-x {
+  -moz-appearance: none;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+#zen-threads-sidebar :focus-visible,
+#zen-threads-panel :focus-visible,
+#zen-threads-compare :focus-visible {
+  outline: 2px solid var(--zen-primary-color, AccentColor);
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zen-thread-done-btn,
+  .zen-thread-row,
+  .zen-ts-row,
+  .zen-thread-section,
+  .ztc-card {
+    transition: none !important;
+  }
 }
 
 .zen-threads-earlier > .zen-thread-header {

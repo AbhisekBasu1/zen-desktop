@@ -371,18 +371,24 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!content) {
       return;
     }
-    const [{ threads, loose }, shelf, checkpoints] = await Promise.all([
-      ZenThreadsStorage.getSnapshot(),
-      ZenThreadsStorage.getShelf(),
-      ZenThreadsStorage.getCheckpoints(),
-    ]);
+    const [{ threads, loose, nodeThread }, shelf, checkpoints] =
+      await Promise.all([
+        ZenThreadsStorage.getSnapshot(),
+        ZenThreadsStorage.getShelf(),
+        ZenThreadsStorage.getCheckpoints(),
+      ]);
 
     const liveTabs = this.#buildLiveMap();
 
     content.replaceChildren();
 
-    if (shelf.length) {
-      content.appendChild(this.#renderShelf(shelf));
+    const selKey = this.#tabKeys.get(gBrowser.selectedTab);
+    const activeThreadId = selKey
+      ? nodeThread.get(selKey) ?? this.#rootKeyOf(selKey)
+      : null;
+    const rankedShelf = this.#rankShelf(shelf, nodeThread, activeThreadId);
+    if (rankedShelf.length) {
+      content.appendChild(this.#renderShelf(rankedShelf));
     }
 
     if (!threads.length && !loose.length && !shelf.length) {
@@ -493,6 +499,30 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     return map;
   }
 
+  /**
+   * The Shelf behaves like memory rather than a folder: recent things stay
+   * near the top, anything belonging to the thread you are in right now
+   * surfaces, and old things quietly recede without being destroyed.
+   */
+  #rankShelf(items, nodeThread, activeThreadId) {
+    const DAY = 86400000;
+    const now = Date.now();
+    return items
+      .map(item => {
+        const ageDays = (now - item.ts) / DAY;
+        const threadId = item.tabKey ? nodeThread.get(item.tabKey) : null;
+        const belongsHere = !!threadId && threadId === activeThreadId;
+        return {
+          ...item,
+          ageDays,
+          belongsHere,
+          // Affinity dominates; recency decays with a two-week half-life.
+          score: (belongsHere ? 1000 : 0) + Math.pow(0.5, ageDays / 14),
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+  }
+
   #renderShelf(items) {
     const section = document.createElementNS(XHTML_NS, "div");
     section.className = "zen-thread-section zen-shelf-section";
@@ -514,23 +544,49 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     const body = document.createElementNS(XHTML_NS, "div");
     body.className = "zen-thread-body";
-    for (const item of items) {
+
+    const RECEDE_DAYS = 90;
+    const current = items.filter(item => item.ageDays <= RECEDE_DAYS);
+    const receded = items.filter(item => item.ageDays > RECEDE_DAYS);
+
+    const renderItem = (item, container) => {
       const row = document.createElementNS(XHTML_NS, "div");
       row.className = "zen-thread-row zen-shelf-row";
+      if (item.belongsHere) {
+        row.classList.add("is-related");
+      }
+      if (item.ageDays > 30) {
+        row.classList.add("is-aged");
+      }
+
+      const icon = document.createElementNS(XHTML_NS, "img");
+      icon.className = "zen-thread-favicon";
+      try {
+        icon.setAttribute(
+          "src",
+          `page-icon:${new URL(item.url).origin}/`
+        );
+      } catch (e) {
+        // Unparseable URL; no icon.
+      }
+      icon.setAttribute("alt", "");
+      icon.addEventListener("error", () => icon.remove());
+      row.appendChild(icon);
+
       const rowTitle = document.createElementNS(XHTML_NS, "span");
       rowTitle.className = "zen-thread-title";
       rowTitle.textContent = item.title || item.url;
       row.appendChild(rowTitle);
-      const host = document.createElementNS(XHTML_NS, "span");
-      host.className = "zen-thread-url";
-      try {
-        host.textContent = new URL(item.url).hostname;
-      } catch (e) {
-        host.textContent = "";
+
+      if (item.belongsHere) {
+        const badge = document.createElementNS(XHTML_NS, "span");
+        badge.className = "zen-shelf-affinity";
+        badge.textContent = "this thread";
+        row.appendChild(badge);
       }
-      row.appendChild(host);
-      const dismiss = document.createElementNS(XHTML_NS, "span");
+      const dismiss = document.createElementNS(XHTML_NS, "button");
       dismiss.className = "zen-shelf-x";
+      dismiss.setAttribute("aria-label", "Remove from shelf");
       dismiss.textContent = "×";
       dismiss.title = "Remove from shelf";
       dismiss.addEventListener("click", e => {
@@ -552,8 +608,33 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           console.error("ZenThreads: shelf reopen failed", e);
         }
       });
-      body.appendChild(row);
+      container.appendChild(row);
+    };
+
+    for (const item of current) {
+      renderItem(item, body);
     }
+
+    if (receded.length) {
+      const older = document.createElementNS(XHTML_NS, "div");
+      older.className = "zen-thread-section zen-shelf-receded collapsed";
+      const olderHeader = document.createElementNS(XHTML_NS, "div");
+      olderHeader.className = "zen-thread-header zen-thread-loose-header";
+      olderHeader.textContent = `Receded · ${receded.length}`;
+      olderHeader.addEventListener("click", e => {
+        e.stopPropagation();
+        older.classList.toggle("collapsed");
+      });
+      older.appendChild(olderHeader);
+      const olderBody = document.createElementNS(XHTML_NS, "div");
+      olderBody.className = "zen-thread-body";
+      for (const item of receded) {
+        renderItem(item, olderBody);
+      }
+      older.appendChild(olderBody);
+      body.appendChild(older);
+    }
+
     section.appendChild(body);
     return section;
   }
@@ -598,7 +679,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
     const compareSet = this.#comparisonSet(thread);
     if (compareSet) {
-      const cmp = document.createElementNS(XHTML_NS, "span");
+      const cmp = document.createElementNS(XHTML_NS, "button");
       cmp.className = "zen-thread-done-btn zen-thread-compare-btn";
       cmp.textContent = `⊞${compareSet.candidates.length}`;
       cmp.title = `Compare ${compareSet.candidates.length} candidates`;
@@ -608,7 +689,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       });
       header.appendChild(cmp);
     }
-    const merge = document.createElementNS(XHTML_NS, "span");
+    const merge = document.createElementNS(XHTML_NS, "button");
     merge.className = "zen-thread-done-btn zen-thread-merge-btn";
     merge.textContent = "⇆";
     merge.title =
@@ -630,7 +711,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     });
     header.appendChild(merge);
 
-    const done = document.createElementNS(XHTML_NS, "span");
+    const done = document.createElementNS(XHTML_NS, "button");
     done.className = "zen-thread-done-btn";
     done.textContent = thread.done ? "↺" : "✓";
     done.title = thread.done
@@ -1220,11 +1301,35 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
       const el = document.createElementNS(XHTML_NS, "div");
       el.id = "zen-threads-sidebar";
+      el.setAttribute("role", "tree");
+      el.setAttribute("aria-label", "Threads");
+      el.addEventListener("keydown", e => this.#onSidebarKeydown(e));
       foot.parentNode.insertBefore(el, foot);
       this.#sidebarEl = el;
       this.#queueSidebarRefresh();
     } catch (e) {
       console.error("ZenThreads: sidebar init failed", e);
+    }
+  }
+
+  #onSidebarKeydown(event) {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+      return;
+    }
+    const rows = [
+      ...(this.#sidebarEl?.querySelectorAll('[role="treeitem"]') ?? []),
+    ];
+    if (!rows.length) {
+      return;
+    }
+    const current = rows.indexOf(document.activeElement);
+    const next =
+      event.key === "ArrowDown"
+        ? Math.min(current + 1, rows.length - 1)
+        : Math.max(current - 1, 0);
+    if (next !== current && rows[next]) {
+      event.preventDefault();
+      rows[next].focus();
     }
   }
 
@@ -1248,7 +1353,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!el || !el.isConnected) {
       return;
     }
-    const [{ threads }, shelf, checkpoints] = await Promise.all([
+    const [{ threads, nodeThread }, shelf, checkpoints] = await Promise.all([
       ZenThreadsStorage.getSnapshot(),
       ZenThreadsStorage.getShelf(),
       ZenThreadsStorage.getCheckpoints(),
@@ -1281,12 +1386,28 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
       const row = document.createElementNS(XHTML_NS, "div");
       row.className = "zen-ts-row";
+      row.setAttribute("role", "treeitem");
+      row.setAttribute("tabindex", "0");
+      row.setAttribute(
+        "aria-expanded",
+        this.#expandedSidebarThreads.has(thread.id) ? "true" : "false"
+      );
+      row.setAttribute(
+        "aria-label",
+        `${thread.title}${hasLive ? ", active" : ", paused"}`
+      );
       if (hasLive) {
         row.classList.add("live");
       }
       if (isActive) {
         row.classList.add("active");
       }
+      row.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.click();
+        }
+      });
       const dot = document.createElementNS(XHTML_NS, "span");
       dot.className = "zen-ts-dot";
       row.appendChild(dot);
@@ -1305,7 +1426,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
       const compareSet = this.#comparisonSet(thread);
       if (compareSet) {
-        const cmp = document.createElementNS(XHTML_NS, "span");
+        const cmp = document.createElementNS(XHTML_NS, "button");
         cmp.className = "zen-thread-done-btn zen-thread-compare-btn";
         cmp.textContent = `⊞${compareSet.candidates.length}`;
         cmp.title = `Compare ${compareSet.candidates.length} candidates`;
@@ -1315,7 +1436,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         });
         row.appendChild(cmp);
       }
-      const merge = document.createElementNS(XHTML_NS, "span");
+      const merge = document.createElementNS(XHTML_NS, "button");
       merge.className = "zen-thread-done-btn zen-thread-merge-btn";
       merge.textContent = "⇆";
       merge.title =
@@ -1336,7 +1457,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       });
       row.appendChild(merge);
 
-      const done = document.createElementNS(XHTML_NS, "span");
+      const done = document.createElementNS(XHTML_NS, "button");
       done.className = "zen-thread-done-btn";
       done.textContent = "✓";
       done.title = "Done — archive thread and close its tabs";
@@ -1386,14 +1507,28 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
 
     if (shelf.length) {
+      const related = this.#rankShelf(shelf, nodeThread, selRoot).filter(
+        item => item.belongsHere
+      ).length;
       const row = document.createElementNS(XHTML_NS, "div");
       row.className = "zen-ts-row zen-ts-shelf";
+      row.setAttribute("role", "treeitem");
+      row.setAttribute("tabindex", "0");
+      row.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.click();
+        }
+      });
+      if (related) {
+        row.classList.add("live");
+      }
       const dot = document.createElementNS(XHTML_NS, "span");
       dot.className = "zen-ts-dot";
       row.appendChild(dot);
       const title = document.createElementNS(XHTML_NS, "span");
       title.className = "zen-ts-title";
-      title.textContent = "Shelf";
+      title.textContent = related ? `Shelf · ${related} from this thread` : "Shelf";
       row.appendChild(title);
       const count = document.createElementNS(XHTML_NS, "span");
       count.className = "zen-ts-time";

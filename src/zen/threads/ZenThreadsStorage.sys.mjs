@@ -277,7 +277,7 @@ export const ZenThreadsStorage = new (class {
     }
     try {
       const rows = await this.#db.execute(
-        `SELECT id, ts, url, title FROM shelf
+        `SELECT id, ts, url, title, tab_key FROM shelf
          WHERE resolved_ts IS NULL ORDER BY ts DESC LIMIT :limit`,
         { limit }
       );
@@ -287,6 +287,7 @@ export const ZenThreadsStorage = new (class {
           ts: row.getResultByName("ts"),
           url: row.getResultByName("url"),
           title: row.getResultByName("title"),
+          tabKey: row.getResultByName("tab_key"),
         });
       }
     } catch (e) {
@@ -476,7 +477,7 @@ export const ZenThreadsStorage = new (class {
     // Wait for pending writes so the snapshot reflects this session so far.
     await this.#writeQueue;
     if (!this.#db) {
-      return { threads: [], loose: [] };
+      return { threads: [], loose: [], nodeThread: new Map() };
     }
 
     let rows;
@@ -711,7 +712,22 @@ export const ZenThreadsStorage = new (class {
 
     threads.sort((a, b) => b.lastTs - a.lastTs);
     loose.sort((a, b) => b.lastTs - a.lastTs);
-    const value = { threads: threads.slice(0, MAX_THREADS), loose };
+    // Reverse index so callers can ask which thread a page belongs to
+    // (used to resurface shelf items alongside their thread).
+    const nodeThread = new Map();
+    const indexNodes = (nodes, threadId) => {
+      for (const node of nodes) {
+        nodeThread.set(node.key, threadId);
+        if (node.children.length) {
+          indexNodes(node.children, threadId);
+        }
+      }
+    };
+    for (const thread of threads) {
+      indexNodes(thread.roots, thread.id);
+    }
+
+    const value = { threads: threads.slice(0, MAX_THREADS), loose, nodeThread };
     this.#snapshotCache = { key: cacheKey, value };
     return value;
   }
