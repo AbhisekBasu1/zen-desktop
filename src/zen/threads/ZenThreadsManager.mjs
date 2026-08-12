@@ -599,16 +599,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
       const icon = document.createElementNS(XHTML_NS, "img");
       icon.className = "zen-thread-favicon";
-      try {
-        icon.setAttribute(
-          "src",
-          `page-icon:${new URL(item.url).origin}/`
-        );
-      } catch (e) {
-        // Unparseable URL; no icon.
-      }
+      icon.setAttribute("src", `page-icon:${item.url}`);
       icon.setAttribute("alt", "");
-      icon.addEventListener("error", () => icon.remove());
       row.appendChild(icon);
 
       const rowTitle = document.createElementNS(XHTML_NS, "span");
@@ -907,7 +899,6 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         icon.setAttribute("src", iconUrl);
       }
       icon.setAttribute("alt", "");
-      icon.addEventListener("error", () => icon.remove());
       row.appendChild(icon);
     }
 
@@ -1246,11 +1237,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (entry?.tab?.image) {
       return entry.tab.image;
     }
-    try {
-      return `page-icon:${new URL(node.url).origin}/`;
-    } catch (e) {
-      return null;
-    }
+    // The full page URL keeps page-specific icons; Places already falls
+    // back origin-ward on its own, and the protocol streams a default
+    // icon rather than failing, so no error handling is needed.
+    return node.url ? `page-icon:${node.url}` : null;
   }
 
   #openCompare(thread, set, liveTabs) {
@@ -1573,25 +1563,72 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
-  #onSidebarKeydown(event) {
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
-      return;
-    }
-    const rows = [
-      ...(this.#sidebarEl?.querySelectorAll('[role="treeitem"]') ?? []),
-    ];
+  #sidebarRows() {
+    return [...(this.#sidebarEl?.querySelectorAll('[role="treeitem"]') ?? [])];
+  }
+
+  /** Keep exactly one row in the tab order, as tree widgets should. */
+  #updateRovingTabstop(preferred) {
+    const rows = this.#sidebarRows();
     if (!rows.length) {
       return;
     }
-    const current = rows.indexOf(document.activeElement);
-    const next =
-      event.key === "ArrowDown"
-        ? Math.min(current + 1, rows.length - 1)
-        : Math.max(current - 1, 0);
-    if (next !== current && rows[next]) {
-      event.preventDefault();
-      rows[next].focus();
+    const target =
+      (preferred && rows.find(r => r.dataset.threadId === preferred)) ||
+      rows[0];
+    for (const row of rows) {
+      row.setAttribute("tabindex", row === target ? "0" : "-1");
     }
+  }
+
+  #onSidebarKeydown(event) {
+    const rows = this.#sidebarRows();
+    if (!rows.length) {
+      return;
+    }
+    const active = document.activeElement;
+    const current = rows.indexOf(active);
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      const next =
+        event.key === "ArrowDown"
+          ? Math.min(current + 1, rows.length - 1)
+          : Math.max(current - 1, 0);
+      if (next !== current && rows[next]) {
+        event.preventDefault();
+        this.#focusRow(rows[next]);
+      }
+      return;
+    }
+
+    if (current < 0) {
+      return;
+    }
+    const threadId = active.dataset.threadId;
+    if (!threadId) {
+      return;
+    }
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      const expanded = this.#expandedSidebarThreads.has(threadId);
+      const wantExpanded = event.key === "ArrowRight";
+      if (expanded === wantExpanded) {
+        return;
+      }
+      event.preventDefault();
+      if (wantExpanded) {
+        this.#expandedSidebarThreads.add(threadId);
+      } else {
+        this.#expandedSidebarThreads.delete(threadId);
+      }
+      this.#refreshSidebar(threadId).catch(() => {});
+    }
+  }
+
+  #focusRow(row) {
+    for (const other of this.#sidebarRows()) {
+      other.setAttribute("tabindex", other === row ? "0" : "-1");
+    }
+    row.focus();
   }
 
   #queueSidebarRefresh() {
@@ -1609,11 +1646,16 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }, 400);
   }
 
-  async #refreshSidebar() {
+  async #refreshSidebar(focusThreadId = null) {
     const el = this.#sidebarEl;
     if (!el || !el.isConnected) {
       return;
     }
+    // Rebuilding the list would otherwise throw away keyboard focus.
+    const hadFocus = el.contains(document.activeElement);
+    const focusTarget =
+      focusThreadId ??
+      (hadFocus ? document.activeElement?.dataset?.threadId : null);
     const [{ threads, nodeThread }, shelf, checkpoints] = await Promise.all([
       ZenThreadsStorage.getSnapshot(),
       ZenThreadsStorage.getShelf(),
@@ -1683,11 +1725,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const row = document.createElementNS(XHTML_NS, "div");
       row.className = "zen-ts-row";
       row.setAttribute("role", "treeitem");
-      row.setAttribute("tabindex", "0");
+      // Roving tabindex: the list is one tab stop, arrows move within it.
+      row.setAttribute("tabindex", "-1");
+      row.dataset.threadId = thread.id;
       row.setAttribute(
         "aria-expanded",
         this.#expandedSidebarThreads.has(thread.id) ? "true" : "false"
       );
+      row.setAttribute("aria-level", "1");
       row.setAttribute(
         "aria-label",
         `${thread.title}${hasLive ? ", active" : ", paused"}`
@@ -1809,7 +1854,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const row = document.createElementNS(XHTML_NS, "div");
       row.className = "zen-ts-row zen-ts-shelf";
       row.setAttribute("role", "treeitem");
-      row.setAttribute("tabindex", "0");
+      row.setAttribute("tabindex", "-1");
+      row.setAttribute("aria-level", "1");
       row.addEventListener("keydown", e => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
@@ -1834,6 +1880,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         this.togglePanel();
       });
       el.appendChild(row);
+    }
+
+    this.#updateRovingTabstop(focusTarget);
+    if (focusTarget && (hadFocus || focusThreadId)) {
+      const restored = this.#sidebarRows().find(
+        r => r.dataset.threadId === focusTarget
+      );
+      restored?.focus();
     }
   }
 
