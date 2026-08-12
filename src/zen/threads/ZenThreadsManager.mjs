@@ -326,6 +326,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       parentKey = this.#keyFor(openerTab);
     }
     if (parentKey) {
+      // Bounded: this only needs to answer root lookups for live work.
+      if (this.#parents.size > 4000) {
+        const oldest = this.#parents.keys().next().value;
+        this.#parents.delete(oldest);
+      }
       this.#parents.set(key, parentKey);
     }
     ZenThreadsStorage.recordEvent(how, key, parentKey, null, tab.label, null);
@@ -1364,6 +1369,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
     const { threads } = await ZenThreadsStorage.getSnapshot();
     const thread = threads.find(t => t.id === rootKey);
+    if (this.#returnCardShown.size > 200) {
+      this.#returnCardShown.clear();
+    }
     this.#returnCardShown.set(rootKey, Date.now());
     this.#showReturnCard({
       title: thread
@@ -1582,9 +1590,6 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     this.#applyTabSalience(threadKeys);
 
     el.replaceChildren();
-    if (!threads.length && !shelf.length) {
-      return;
-    }
 
     const header = document.createElementNS(XHTML_NS, "div");
     header.className = "zen-ts-header";
@@ -1602,6 +1607,15 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     );
     header.appendChild(journalBtn);
     el.appendChild(header);
+
+    if (!threads.length && !shelf.length) {
+      const hint = document.createElementNS(XHTML_NS, "div");
+      hint.className = "zen-ts-hint";
+      hint.textContent =
+        "Research trails gather here on their own. ⌘S shelves a page for later.";
+      el.appendChild(hint);
+      return;
+    }
 
     const visible = threads
       .filter(t => {
