@@ -213,17 +213,20 @@ export const ZenThreadsStorage = new (class {
 
   recordEvent(kind, tabKey, parentKey, url, title, query) {
     this.#eventSeq++;
+    // Stamp when the event happened, not when the queued write drains —
+    // a busy queue would otherwise smear session boundaries.
+    const ts = Date.now();
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
         return;
       }
       try {
-        await this.#db.execute(
+        await this.#db.executeCached(
           `INSERT INTO events (ts, kind, tab, parent, url, title, search_query)
            VALUES (:ts, :kind, :tab, :parent, :url, :title, :query)`,
           {
-            ts: Date.now(),
+            ts,
             kind,
             tab: tabKey,
             parent: parentKey ?? null,
@@ -282,6 +285,7 @@ export const ZenThreadsStorage = new (class {
 
   shelvePage(url, title, tabKey) {
     this.#shelfRev++;
+    const ts = Date.now();
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -291,7 +295,7 @@ export const ZenThreadsStorage = new (class {
         await this.#db.execute(
           `INSERT INTO shelf (ts, url, title, tab_key)
            VALUES (:ts, :url, :title, :tabKey)`,
-          { ts: Date.now(), url, title: title ?? null, tabKey: tabKey ?? null }
+          { ts, url, title: title ?? null, tabKey: tabKey ?? null }
         );
       } catch (e) {
         console.error("ZenThreadsStorage: shelvePage failed", e);
@@ -332,7 +336,7 @@ export const ZenThreadsStorage = new (class {
       return items;
     }
     try {
-      const rows = await this.#db.execute(
+      const rows = await this.#db.executeCached(
         `SELECT id, ts, url, title, tab_key FROM shelf
          WHERE resolved_ts IS NULL ORDER BY ts DESC LIMIT :limit`,
         { limit }
@@ -355,6 +359,7 @@ export const ZenThreadsStorage = new (class {
 
   setCheckpoint(threadId, note, lastUrl, lastTitle) {
     this.#checkpointRev++;
+    const ts = Date.now();
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -373,7 +378,7 @@ export const ZenThreadsStorage = new (class {
              last_title = COALESCE(:lastTitle, checkpoints.last_title)`,
           {
             threadId,
-            ts: Date.now(),
+            ts,
             note: note ?? null,
             lastUrl: lastUrl ?? null,
             lastTitle: lastTitle ?? null,
@@ -397,7 +402,7 @@ export const ZenThreadsStorage = new (class {
       return map;
     }
     try {
-      const rows = await this.#db.execute(
+      const rows = await this.#db.executeCached(
         "SELECT thread_id, ts, note, last_url, last_title FROM checkpoints"
       );
       for (const row of rows) {
@@ -436,6 +441,7 @@ export const ZenThreadsStorage = new (class {
 
   linkThreads(a, b) {
     this.#linkRev++;
+    const ts = Date.now();
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -445,7 +451,7 @@ export const ZenThreadsStorage = new (class {
         await this.#db.execute(
           `INSERT OR REPLACE INTO thread_links (a, b, ts)
            VALUES (:a, :b, :ts)`,
-          { a, b, ts: Date.now() }
+          { a, b, ts }
         );
       } catch (e) {
         console.error("ZenThreadsStorage: linkThreads failed", e);
@@ -459,7 +465,7 @@ export const ZenThreadsStorage = new (class {
       return links;
     }
     try {
-      const rows = await this.#db.execute("SELECT a, b FROM thread_links");
+      const rows = await this.#db.executeCached("SELECT a, b FROM thread_links");
       for (const row of rows) {
         links.push([row.getResultByName("a"), row.getResultByName("b")]);
       }
@@ -471,6 +477,7 @@ export const ZenThreadsStorage = new (class {
 
   setThreadStatus(threadId, status) {
     this.#metaRev++;
+    const ts = Date.now();
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -481,7 +488,7 @@ export const ZenThreadsStorage = new (class {
           `INSERT INTO thread_meta (thread_id, status, status_ts)
            VALUES (:threadId, :status, :ts)
            ON CONFLICT(thread_id) DO UPDATE SET status = :status, status_ts = :ts`,
-          { threadId, status: status ?? null, ts: Date.now() }
+          { threadId, status: status ?? null, ts }
         );
       } catch (e) {
         console.error("ZenThreadsStorage: setThreadStatus failed", e);
@@ -499,7 +506,7 @@ export const ZenThreadsStorage = new (class {
       return map;
     }
     try {
-      const rows = await this.#db.execute(
+      const rows = await this.#db.executeCached(
         "SELECT thread_id, title, status, status_ts FROM thread_meta"
       );
       for (const row of rows) {
@@ -613,7 +620,7 @@ export const ZenThreadsStorage = new (class {
              FROM events WHERE ts > :cutoff ORDER BY id ASC`,
             { cutoff: Date.now() - SNAPSHOT_WINDOW_MS }
           )
-        : await this.#db.execute(
+        : await this.#db.executeCached(
             `SELECT id, ts, kind, tab, parent, url, title, search_query
              FROM events WHERE id > :sinceId ORDER BY id ASC`,
             { sinceId: this.#maxEventId }

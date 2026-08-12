@@ -312,6 +312,16 @@
 }
 
 /* Compare mode: turn a research trail into a decision surface. */
+
+/* HTML's `hidden` is only a presentation hint (see engine html.css), so an
+   author `display` on these divs would otherwise win and pin the overlay
+   permanently over the page. XUL elements get a real UA rule; HTML ones
+   need this. */
+#zen-threads-compare-backdrop[hidden],
+#zen-threads-return-card[hidden] {
+  display: none !important;
+}
+
 #zen-threads-compare-backdrop {
   position: fixed;
   inset: 0;
@@ -462,6 +472,13 @@
 }
 
 /* Compact always-on sidebar section */
+/* Compact mode collapses the sidebar to icons; a text list there would be
+   noise fighting for the same space as the tab strip. */
+:root[zen-compact-mode="true"] #zen-threads-sidebar,
+#zen-threads-sidebar:empty {
+  display: none;
+}
+
 #zen-threads-sidebar {
   margin: 4px 8px 2px;
   padding: 8px 2px 6px;

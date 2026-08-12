@@ -52,7 +52,12 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #mergeSource = null; // thread id armed for merging
   #pendingGlance = new WeakMap(); // peeked tab -> its provenance, held back
   #returnCardTimer = null;
+  #returnCardSettleTimer = null;
+  #returnCardGen = 0;
   #returnCardShown = new Map(); // threadId -> ts, so a return is announced once
+  #nodeThread = new Map(); // tabKey -> threadId, from the latest snapshot
+  #startupObserver = null;
+  #startupTopic = null;
 
   init() {
     try {
@@ -65,14 +70,16 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       ) {
         this.#start();
       } else {
-        const topic = "browser-delayed-startup-finished";
-        const observer = subject => {
+        // Held on the instance so unload can unregister it — a window that
+        // closes before delayed startup would otherwise leak itself.
+        this.#startupTopic = "browser-delayed-startup-finished";
+        this.#startupObserver = subject => {
           if (subject === window) {
-            Services.obs.removeObserver(observer, topic);
+            this.#removeStartupObserver();
             this.#start();
           }
         };
-        Services.obs.addObserver(observer, topic);
+        Services.obs.addObserver(this.#startupObserver, this.#startupTopic);
       }
     } catch (e) {
       console.error("ZenThreads: init failed", e);
@@ -207,8 +214,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             const prevKey = this.#tabKeys.get(prev);
             const nextKey = this.#tabKeys.get(next);
             if (prevKey) {
-              const prevRoot = this.#rootKeyOf(prevKey);
-              const nextRoot = nextKey ? this.#rootKeyOf(nextKey) : null;
+              // Use the storage-derived thread id: the session-local parent
+              // walk is empty for restored tabs, which would key checkpoints
+              // under an id nothing ever reads back.
+              const prevRoot = this.#threadIdFor(prevKey);
+              const nextRoot = nextKey ? this.#threadIdFor(nextKey) : null;
               if (prevRoot !== nextRoot) {
                 ZenThreadsStorage.setCheckpoint(
                   prevRoot,
@@ -217,7 +227,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
                   prev.label ?? null
                 );
                 if (nextRoot) {
-                  this.#maybeShowReturnCard(nextRoot).catch(() => {});
+                  // Let rapid tab flicking settle before announcing.
+                  if (this.#returnCardSettleTimer) {
+                    clearTimeout(this.#returnCardSettleTimer);
+                  }
+                  this.#returnCardSettleTimer = setTimeout(() => {
+                    this.#returnCardSettleTimer = null;
+                    this.#maybeShowReturnCard(nextRoot).catch(() => {});
+                  }, 250);
                 }
               }
             }
@@ -259,12 +276,26 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             break;
           }
           if (event.key === "Escape") {
+            // Dismiss only the topmost surface, so closing Compare does not
+            // also close the panel it was opened from.
+            const backdrop = document.getElementById(
+              "zen-threads-compare-backdrop"
+            );
+            const card = document.getElementById("zen-threads-return-card");
             const panel = document.getElementById("zen-threads-panel");
-            if (panel && !panel.hidden) {
+            if (backdrop && !backdrop.hidden) {
+              event.preventDefault();
+              event.stopPropagation();
+              this.#closeCompare();
+            } else if (card && !card.hidden) {
+              event.preventDefault();
+              event.stopPropagation();
+              this.#hideReturnCard();
+            } else if (panel && !panel.hidden) {
+              event.preventDefault();
+              event.stopPropagation();
               panel.hidden = true;
             }
-            this.#hideReturnCard();
-            this.#closeCompare();
           }
           break;
         }
@@ -276,6 +307,19 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           } catch (e) {
             // Window teardown; nothing useful to do.
           }
+          this.#removeStartupObserver();
+          for (const timer of [
+            this.#sidebarRefreshTimer,
+            this.#returnCardTimer,
+            this.#returnCardSettleTimer,
+          ]) {
+            if (timer) {
+              clearTimeout(timer);
+            }
+          }
+          this.#sidebarRefreshTimer = null;
+          this.#returnCardTimer = null;
+          this.#returnCardSettleTimer = null;
           break;
         }
       }
@@ -420,10 +464,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     content.replaceChildren();
 
+    this.#nodeThread = nodeThread;
     const selKey = this.#tabKeys.get(gBrowser.selectedTab);
-    const activeThreadId = selKey
-      ? nodeThread.get(selKey) ?? this.#rootKeyOf(selKey)
-      : null;
+    const activeThreadId = selKey ? this.#threadIdFor(selKey) : null;
     const rankedShelf = this.#rankShelf(shelf, nodeThread, activeThreadId);
     if (rankedShelf.length) {
       content.appendChild(this.#renderShelf(rankedShelf));
@@ -753,7 +796,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         ZenThreadsStorage.setThreadStatus(thread.id, null);
       } else {
         ZenThreadsStorage.setThreadStatus(thread.id, "done");
-        for (const t of liveThreadTabs) {
+        const closable = [];
+        this.#collectLiveTabs(thread.roots, liveTabs, closable, {
+          includePinned: true,
+        });
+        for (const t of closable) {
           try {
             gBrowser.removeTab(t, { animate: true });
           } catch (err) {
@@ -961,21 +1008,30 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
-  #collectLiveTabs(nodes, liveTabs, out) {
+  /**
+   * Tabs of this thread living in this window. Grouping pins tabs, so the
+   * Done path must include pinned ones or it would find nothing to close
+   * once a thread has been grouped into a folder.
+   */
+  #collectLiveTabs(nodes, liveTabs, out, { includePinned = false } = {}) {
     for (const node of nodes) {
       const entry = liveTabs.get(node.key);
       if (
         entry &&
         entry.win === window &&
-        !entry.tab.pinned &&
+        (includePinned || !entry.tab.pinned) &&
         !out.includes(entry.tab)
       ) {
         out.push(entry.tab);
       }
       if (node.children.length) {
-        this.#collectLiveTabs(node.children, liveTabs, out);
+        this.#collectLiveTabs(node.children, liveTabs, out, { includePinned });
       }
     }
+  }
+
+  #threadIdFor(key) {
+    return this.#nodeThread.get(key) ?? this.#rootKeyOf(key);
   }
 
   #rootKeyOf(key) {
@@ -1315,9 +1371,12 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       open.addEventListener("click", e => {
         e.stopPropagation();
         this.#closeCompare();
-        if (entry) {
-          entry.win.focus();
-          entry.win.gBrowser.selectedTab = entry.tab;
+        // Re-resolve: the grid may have been open long enough for the tab
+        // to have been closed or moved to another window.
+        const current = this.#buildLiveMap().get(node.key);
+        if (current && !current.win.closed) {
+          current.win.focus();
+          current.win.gBrowser.selectedTab = current.tab;
         } else {
           this.#reopen(node);
         }
@@ -1384,7 +1443,21 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (shownAt && Date.now() - shownAt < REANNOUNCE_MS) {
       return;
     }
+    // Don't interrupt typing in the address bar, and don't announce into a
+    // window the user isn't looking at.
+    if (!document.hasFocus() || gURLBar?.focused || gURLBar?.view?.isOpen) {
+      return;
+    }
+
+    const gen = ++this.#returnCardGen;
+    const stillCurrent = () =>
+      gen === this.#returnCardGen &&
+      this.#threadIdFor(this.#tabKeys.get(gBrowser.selectedTab)) === rootKey;
+
     const checkpoints = await ZenThreadsStorage.getCheckpoints();
+    if (!stillCurrent()) {
+      return;
+    }
     const cp = checkpoints.get(rootKey);
     if (!cp || !cp.ts) {
       return;
@@ -1397,6 +1470,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       return;
     }
     const { threads } = await ZenThreadsStorage.getSnapshot();
+    if (!stillCurrent()) {
+      return;
+    }
     const thread = threads.find(t => t.id === rootKey);
     if (this.#returnCardShown.size > 200) {
       this.#returnCardShown.clear();
@@ -1464,24 +1540,33 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
     };
     card.onmouseleave = () => {
-      this.#returnCardTimer = setTimeout(dismiss, 2000);
+      if (!card.hidden) {
+        this.#returnCardTimer = setTimeout(dismiss, 2000);
+      }
     };
     this.#returnCardTimer = setTimeout(dismiss, 6500);
   }
 
   #hideReturnCard() {
-    const card = document.getElementById("zen-threads-return-card");
-    if (!card || card.hidden) {
-      return;
-    }
+    // Disarm first: an already-hidden card must not leave a timer running
+    // that would fire into the next card's lifetime.
     if (this.#returnCardTimer) {
       clearTimeout(this.#returnCardTimer);
       this.#returnCardTimer = null;
     }
-    const motion = window.gZenUIManager?.motion;
+    const card = document.getElementById("zen-threads-return-card");
+    if (!card || card.hidden) {
+      return;
+    }
+    const motion = this.#prefersReducedMotion()
+      ? null
+      : window.gZenUIManager?.motion;
     const finish = () => {
       card.hidden = true;
       card.replaceChildren();
+      card.onclick = null;
+      card.onmouseenter = null;
+      card.onmouseleave = null;
     };
     if (motion) {
       motion
@@ -1494,6 +1579,18 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     } else {
       finish();
     }
+  }
+
+  #removeStartupObserver() {
+    if (!this.#startupObserver) {
+      return;
+    }
+    try {
+      Services.obs.removeObserver(this.#startupObserver, this.#startupTopic);
+    } catch (e) {
+      // Already removed.
+    }
+    this.#startupObserver = null;
   }
 
   #prefersReducedMotion() {
@@ -1661,9 +1758,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       ZenThreadsStorage.getShelf(),
       ZenThreadsStorage.getCheckpoints(),
     ]);
+    this.#nodeThread = nodeThread;
     const liveTabs = this.#buildLiveMap();
     const selKey = this.#tabKeys.get(gBrowser.selectedTab);
-    const selRoot = selKey ? nodeThread.get(selKey) ?? this.#rootKeyOf(selKey) : null;
+    const selRoot = selKey ? this.#threadIdFor(selKey) : null;
 
     // Tabs belonging to the thread currently in focus.
     const activeThread = threads.find(t => t.id === selRoot);
@@ -1806,7 +1904,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         e.stopPropagation();
         ZenThreadsStorage.setThreadStatus(thread.id, "done");
         const out = [];
-        this.#collectLiveTabs(thread.roots, liveTabs, out);
+        this.#collectLiveTabs(thread.roots, liveTabs, out, {
+          includePinned: true,
+        });
         for (const t of out) {
           try {
             gBrowser.removeTab(t, { animate: true });
