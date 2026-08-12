@@ -53,6 +53,18 @@ export const ZenThreadsStorage = new (class {
   #writeQueue = Promise.resolve();
   #shutdownBlocker = null;
 
+  // Revisions bumped synchronously on write, so caches invalidate exactly.
+  // Split by what each read actually depends on: a checkpoint write must not
+  // invalidate the (expensive) derived thread graph.
+  #eventSeq = 0;
+  #linkRev = 0;
+  #metaRev = 0;
+  #checkpointRev = 0;
+  #shelfRev = 0;
+  #snapshotCache = null;
+  #shelfCache = null;
+  #checkpointCache = null;
+
   constructor() {
     this.#dbReady = this.#open();
   }
@@ -147,6 +159,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   recordEvent(kind, tabKey, parentKey, url, title, query) {
+    this.#eventSeq++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -173,6 +186,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   setThreadFolder(threadId, folderId) {
+    this.#metaRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -214,6 +228,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   shelvePage(url, title, tabKey) {
+    this.#shelfRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -232,6 +247,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   resolveShelfItem(id, restored) {
+    this.#shelfRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -250,6 +266,9 @@ export const ZenThreadsStorage = new (class {
   }
 
   async getShelf(limit = 30) {
+    if (this.#shelfCache?.key === `${this.#shelfRev}:${limit}`) {
+      return this.#shelfCache.value;
+    }
     await this.#dbReady;
     await this.#writeQueue;
     const items = [];
@@ -273,10 +292,12 @@ export const ZenThreadsStorage = new (class {
     } catch (e) {
       console.error("ZenThreadsStorage: getShelf failed", e);
     }
+    this.#shelfCache = { key: `${this.#shelfRev}:${limit}`, value: items };
     return items;
   }
 
   setCheckpoint(threadId, note, lastUrl, lastTitle) {
+    this.#checkpointRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -308,6 +329,9 @@ export const ZenThreadsStorage = new (class {
   }
 
   async getCheckpoints() {
+    if (this.#checkpointCache?.key === this.#checkpointRev) {
+      return this.#checkpointCache.value;
+    }
     await this.#dbReady;
     await this.#writeQueue;
     const map = new Map();
@@ -329,10 +353,12 @@ export const ZenThreadsStorage = new (class {
     } catch (e) {
       console.error("ZenThreadsStorage: getCheckpoints failed", e);
     }
+    this.#checkpointCache = { key: this.#checkpointRev, value: map };
     return map;
   }
 
   setThreadTitle(threadId, title) {
+    this.#metaRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -351,6 +377,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   linkThreads(a, b) {
+    this.#linkRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -385,6 +412,7 @@ export const ZenThreadsStorage = new (class {
   }
 
   setThreadStatus(threadId, status) {
+    this.#metaRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
       if (!this.#db) {
@@ -435,6 +463,15 @@ export const ZenThreadsStorage = new (class {
    * "loose" holds nodes of components below the thread threshold.
    */
   async getSnapshot() {
+    // Deriving the graph is the expensive path; skip it entirely when
+    // nothing that feeds it has changed since the last derivation.
+    // Tiers depend on elapsed time, so let the cache lapse every few minutes
+    // even when nothing was written.
+    const timeBucket = Math.floor(Date.now() / 300000);
+    const cacheKey = `${this.#eventSeq}:${this.#linkRev}:${this.#metaRev}:${timeBucket}`;
+    if (this.#snapshotCache?.key === cacheKey) {
+      return this.#snapshotCache.value;
+    }
     await this.#dbReady;
     // Wait for pending writes so the snapshot reflects this session so far.
     await this.#writeQueue;
@@ -674,7 +711,9 @@ export const ZenThreadsStorage = new (class {
 
     threads.sort((a, b) => b.lastTs - a.lastTs);
     loose.sort((a, b) => b.lastTs - a.lastTs);
-    return { threads: threads.slice(0, MAX_THREADS), loose };
+    const value = { threads: threads.slice(0, MAX_THREADS), loose };
+    this.#snapshotCache = { key: cacheKey, value };
+    return value;
   }
 
   #titleFor(root) {

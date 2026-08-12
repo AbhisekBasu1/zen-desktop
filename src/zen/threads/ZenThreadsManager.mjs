@@ -50,6 +50,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #expandedSidebarThreads = new Set();
   #showArchived = false;
   #mergeSource = null; // thread id armed for merging
+  #returnCardTimer = null;
+  #returnCardShown = new Map(); // threadId -> ts, so a return is announced once
 
   init() {
     try {
@@ -206,6 +208,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
                   prev.linkedBrowser?.currentURI?.spec ?? null,
                   prev.label ?? null
                 );
+                if (nextRoot) {
+                  this.#maybeShowReturnCard(nextRoot).catch(() => {});
+                }
               }
             }
           }
@@ -250,6 +255,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             if (panel && !panel.hidden) {
               panel.hidden = true;
             }
+            this.#hideReturnCard();
+            this.#closeCompare();
           }
           break;
         }
@@ -589,6 +596,18 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (thread.id === this.#mergeSource) {
       section.classList.add("zen-thread-merge-armed");
     }
+    const compareSet = this.#comparisonSet(thread);
+    if (compareSet) {
+      const cmp = document.createElementNS(XHTML_NS, "span");
+      cmp.className = "zen-thread-done-btn zen-thread-compare-btn";
+      cmp.textContent = `⊞${compareSet.candidates.length}`;
+      cmp.title = `Compare ${compareSet.candidates.length} candidates`;
+      cmp.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#openCompare(thread, compareSet, liveTabs);
+      });
+      header.appendChild(cmp);
+    }
     const merge = document.createElementNS(XHTML_NS, "span");
     merge.className = "zen-thread-done-btn zen-thread-merge-btn";
     merge.textContent = "⇆";
@@ -761,6 +780,18 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       row.classList.add("zen-thread-search");
     }
 
+    if (!node.isSearch && node.url) {
+      const icon = document.createElementNS(XHTML_NS, "img");
+      icon.className = "zen-thread-favicon";
+      const iconUrl = this.#faviconFor(node, entry);
+      if (iconUrl) {
+        icon.setAttribute("src", iconUrl);
+      }
+      icon.setAttribute("alt", "");
+      icon.addEventListener("error", () => icon.remove());
+      row.appendChild(icon);
+    }
+
     const title = document.createElementNS(XHTML_NS, "span");
     title.className = "zen-thread-title";
     if (node.isSearch && node.query) {
@@ -888,6 +919,299 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
+  // -- compare mode ----------------------------------------------------------
+
+  /**
+   * A decision usually looks like one search with several candidates hanging
+   * off it. Find the widest such fan-out in a thread.
+   */
+  #comparisonSet(thread) {
+    const MIN_SIBLINGS = 3;
+    let best = null;
+    const walk = nodes => {
+      for (const node of nodes) {
+        const candidates = node.children.filter(c => /^https?:/.test(c.url));
+        if (
+          candidates.length >= MIN_SIBLINGS &&
+          (!best || candidates.length > best.candidates.length)
+        ) {
+          best = { parent: node, candidates };
+        }
+        if (node.children.length) {
+          walk(node.children);
+        }
+      }
+    };
+    walk(thread.roots);
+    return best;
+  }
+
+  #faviconFor(node, entry) {
+    if (entry?.tab?.image) {
+      return entry.tab.image;
+    }
+    try {
+      return `page-icon:${new URL(node.url).origin}/`;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  #openCompare(thread, set, liveTabs) {
+    const backdrop = document.getElementById("zen-threads-compare-backdrop");
+    const host = document.getElementById("zen-threads-compare");
+    if (!backdrop || !host) {
+      return;
+    }
+
+    const header = document.createElementNS(XHTML_NS, "div");
+    header.className = "ztc-header";
+    const heading = document.createElementNS(XHTML_NS, "div");
+    heading.className = "ztc-heading";
+    heading.textContent = thread.isSearch
+      ? `Comparing ${set.candidates.length} results for “${thread.title}”`
+      : `Comparing ${set.candidates.length} pages from “${thread.title}”`;
+    header.appendChild(heading);
+    const close = document.createElementNS(XHTML_NS, "button");
+    close.className = "ztc-close";
+    close.textContent = "✕";
+    close.addEventListener("click", () => this.#closeCompare());
+    header.appendChild(close);
+
+    const grid = document.createElementNS(XHTML_NS, "div");
+    grid.className = "ztc-grid";
+    grid.style.setProperty(
+      "--ztc-columns",
+      String(Math.min(set.candidates.length, 4))
+    );
+
+    for (const node of set.candidates) {
+      const entry = liveTabs.get(node.key);
+      const card = document.createElementNS(XHTML_NS, "div");
+      card.className = "ztc-card";
+      if (!entry) {
+        card.classList.add("is-closed");
+      }
+
+      const top = document.createElementNS(XHTML_NS, "div");
+      top.className = "ztc-card-top";
+      const icon = document.createElementNS(XHTML_NS, "img");
+      icon.className = "ztc-favicon";
+      const iconUrl = this.#faviconFor(node, entry);
+      if (iconUrl) {
+        icon.setAttribute("src", iconUrl);
+      }
+      icon.setAttribute("alt", "");
+      top.appendChild(icon);
+      const host_ = document.createElementNS(XHTML_NS, "span");
+      host_.className = "ztc-host";
+      try {
+        host_.textContent = new URL(node.url).hostname.replace(/^www\./, "");
+      } catch (e) {
+        host_.textContent = "";
+      }
+      top.appendChild(host_);
+      card.appendChild(top);
+
+      const title = document.createElementNS(XHTML_NS, "div");
+      title.className = "ztc-title";
+      title.textContent = (entry ? entry.tab.label : node.title) || node.url;
+      card.appendChild(title);
+
+      const state = document.createElementNS(XHTML_NS, "div");
+      state.className = "ztc-state";
+      state.textContent = entry ? "open" : "closed";
+      card.appendChild(state);
+
+      const open = document.createElementNS(XHTML_NS, "button");
+      open.className = "ztc-open";
+      open.textContent = entry ? "Go to tab" : "Reopen";
+      open.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#closeCompare();
+        if (entry) {
+          entry.win.focus();
+          entry.win.gBrowser.selectedTab = entry.tab;
+        } else {
+          this.#reopen(node);
+        }
+      });
+      card.appendChild(open);
+
+      grid.appendChild(card);
+    }
+
+    host.replaceChildren(header, grid);
+    backdrop.hidden = false;
+    backdrop.onclick = e => {
+      if (e.target === backdrop) {
+        this.#closeCompare();
+      }
+    };
+
+    const motion = window.gZenUIManager?.motion;
+    if (motion) {
+      motion.animate(backdrop, { opacity: [0, 1] }, { duration: 0.18 });
+      motion.animate(
+        host,
+        { opacity: [0, 1], transform: ["scale(0.97)", "scale(1)"] },
+        { duration: 0.24, bounce: 0 }
+      );
+    }
+  }
+
+  #closeCompare() {
+    const backdrop = document.getElementById("zen-threads-compare-backdrop");
+    const host = document.getElementById("zen-threads-compare");
+    if (!backdrop || backdrop.hidden) {
+      return;
+    }
+    const finish = () => {
+      backdrop.hidden = true;
+      host?.replaceChildren();
+    };
+    const motion = window.gZenUIManager?.motion;
+    if (motion) {
+      motion
+        .animate(backdrop, { opacity: [1, 0] }, { duration: 0.16 })
+        .then(finish, finish);
+    } else {
+      finish();
+    }
+  }
+
+  // -- return card -----------------------------------------------------------
+
+  async #maybeShowReturnCard(rootKey) {
+    // Overridable so the card can be exercised without waiting hours.
+    const MIN_AWAY_MS = Services.prefs.getIntPref(
+      "zen.threads.return-card.min-away-seconds",
+      2 * 60 * 60
+    ) * 1000;
+    const REANNOUNCE_MS = 30 * 60 * 1000;
+
+    const shownAt = this.#returnCardShown.get(rootKey);
+    if (shownAt && Date.now() - shownAt < REANNOUNCE_MS) {
+      return;
+    }
+    const checkpoints = await ZenThreadsStorage.getCheckpoints();
+    const cp = checkpoints.get(rootKey);
+    if (!cp || !cp.ts) {
+      return;
+    }
+    const away = Date.now() - cp.ts;
+    if (away < MIN_AWAY_MS) {
+      return;
+    }
+    if (!cp.note && !cp.lastTitle) {
+      return;
+    }
+    const { threads } = await ZenThreadsStorage.getSnapshot();
+    const thread = threads.find(t => t.id === rootKey);
+    this.#returnCardShown.set(rootKey, Date.now());
+    this.#showReturnCard({
+      title: thread
+        ? thread.isSearch
+          ? `\u{1F50D} ${thread.title}`
+          : thread.title
+        : "Earlier thread",
+      note: cp.note,
+      lastTitle: cp.lastTitle,
+      away,
+    });
+  }
+
+  #showReturnCard({ title, note, lastTitle, away }) {
+    const card = document.getElementById("zen-threads-return-card");
+    if (!card) {
+      return;
+    }
+    if (this.#returnCardTimer) {
+      clearTimeout(this.#returnCardTimer);
+      this.#returnCardTimer = null;
+    }
+
+    const label = document.createElementNS(XHTML_NS, "div");
+    label.className = "ztrc-label";
+    label.textContent = `Where you left off · ${this.#humanDuration(away)} ago`;
+
+    const heading = document.createElementNS(XHTML_NS, "div");
+    heading.className = "ztrc-title";
+    heading.textContent = title;
+
+    const body = document.createElementNS(XHTML_NS, "div");
+    body.className = "ztrc-note";
+    body.textContent = note ? `next: ${note}` : lastTitle;
+    if (note) {
+      body.classList.add("is-intention");
+    }
+
+    card.replaceChildren(label, heading, body);
+    card.hidden = false;
+
+    const motion = window.gZenUIManager?.motion;
+    if (motion) {
+      motion.animate(
+        card,
+        { opacity: [0, 1], transform: ["translateY(-8px)", "translateY(0)"] },
+        { duration: 0.28, bounce: 0 }
+      );
+    }
+
+    const dismiss = () => this.#hideReturnCard();
+    card.onclick = dismiss;
+    card.onmouseenter = () => {
+      if (this.#returnCardTimer) {
+        clearTimeout(this.#returnCardTimer);
+        this.#returnCardTimer = null;
+      }
+    };
+    card.onmouseleave = () => {
+      this.#returnCardTimer = setTimeout(dismiss, 2000);
+    };
+    this.#returnCardTimer = setTimeout(dismiss, 6500);
+  }
+
+  #hideReturnCard() {
+    const card = document.getElementById("zen-threads-return-card");
+    if (!card || card.hidden) {
+      return;
+    }
+    if (this.#returnCardTimer) {
+      clearTimeout(this.#returnCardTimer);
+      this.#returnCardTimer = null;
+    }
+    const motion = window.gZenUIManager?.motion;
+    const finish = () => {
+      card.hidden = true;
+      card.replaceChildren();
+    };
+    if (motion) {
+      motion
+        .animate(
+          card,
+          { opacity: [1, 0], transform: ["translateY(0)", "translateY(-6px)"] },
+          { duration: 0.2, bounce: 0 }
+        )
+        .then(finish, finish);
+    } else {
+      finish();
+    }
+  }
+
+  #humanDuration(ms) {
+    const minutes = Math.round(ms / 60000);
+    if (minutes < 60) {
+      return `${minutes}m`;
+    }
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) {
+      return `${hours}h`;
+    }
+    const days = Math.round(hours / 24);
+    return days === 1 ? "a day" : `${days} days`;
+  }
+
   #initSidebar() {
     try {
       const foot = document.getElementById("zen-sidebar-foot-buttons");
@@ -978,6 +1302,18 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       row.appendChild(time);
       if (thread.id === this.#mergeSource) {
         row.classList.add("zen-thread-merge-armed");
+      }
+      const compareSet = this.#comparisonSet(thread);
+      if (compareSet) {
+        const cmp = document.createElementNS(XHTML_NS, "span");
+        cmp.className = "zen-thread-done-btn zen-thread-compare-btn";
+        cmp.textContent = `⊞${compareSet.candidates.length}`;
+        cmp.title = `Compare ${compareSet.candidates.length} candidates`;
+        cmp.addEventListener("click", e => {
+          e.stopPropagation();
+          this.#openCompare(thread, compareSet, liveTabs);
+        });
+        row.appendChild(cmp);
       }
       const merge = document.createElementNS(XHTML_NS, "span");
       merge.className = "zen-thread-done-btn zen-thread-merge-btn";
