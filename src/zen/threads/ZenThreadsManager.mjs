@@ -50,6 +50,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #expandedSidebarThreads = new Set();
   #showArchived = false;
   #mergeSource = null; // thread id armed for merging
+  #pendingGlance = new WeakMap(); // peeked tab -> its provenance, held back
   #returnCardTimer = null;
   #returnCardShown = new Map(); // threadId -> ts, so a return is announced once
 
@@ -94,6 +95,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       window.addEventListener("TabClose", this);
       window.addEventListener("TabSelect", this);
       window.addEventListener("SSTabRestoring", this);
+      window.addEventListener("GlanceClose", this, true);
       window.addEventListener("keydown", this, true);
       this.#progressListener = {
         onLocationChange: (browser, webProgress, request, location, flags) => {
@@ -157,8 +159,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           this.#queueSidebarRefresh();
           break;
         }
+        case "GlanceClose": {
+          // Dismissed without being promoted: it leaves no trace.
+          this.#pendingGlance.delete(event.target);
+          break;
+        }
         case "TabClose": {
           const tab = event.target;
+          this.#pendingGlance.delete(tab);
           const key = this.#tabKeys.get(tab);
           if (key) {
             ZenThreadsStorage.recordEvent(
@@ -320,6 +328,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   }
 
   #registerTab(tab, openerTab, how, parentKeyOverride = null) {
+    // A Glance is a peek, not a commitment (idea1 §9: attention causes
+    // persistence). Hold its provenance back until it is promoted into a
+    // real tab; if it is dismissed, nothing was ever recorded.
+    if (tab.hasAttribute?.("zen-glance-tab")) {
+      this.#pendingGlance.set(tab, { openerTab, parentKeyOverride, how });
+      return;
+    }
     const key = this.#keyFor(tab);
     let parentKey = parentKeyOverride;
     if (!parentKey && openerTab) {
@@ -345,9 +360,27 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!spec || !/^https?:/.test(spec)) {
       return; // only real web navigations belong in trails
     }
+    if (tab.hasAttribute?.("zen-glance-tab")) {
+      return; // still a peek
+    }
+    this.#promoteGlance(tab);
     const key = this.#keyFor(tab);
     const query = this.#detectSearch(spec);
     ZenThreadsStorage.recordEvent("nav", key, null, spec, tab.label, query);
+  }
+
+  #promoteGlance(tab) {
+    const pending = this.#pendingGlance.get(tab);
+    if (!pending) {
+      return;
+    }
+    this.#pendingGlance.delete(tab);
+    this.#registerTab(
+      tab,
+      pending.openerTab,
+      pending.how,
+      pending.parentKeyOverride
+    );
   }
 
   #detectSearch(spec) {
