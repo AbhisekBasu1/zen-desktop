@@ -507,12 +507,132 @@
 }
 
 .zen-ts-header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   opacity: 0.5;
   font-weight: 600;
   font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   padding: 2px 6px 5px;
+}
+
+.zen-ts-journal-btn {
+  -moz-appearance: none;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  margin-inline-start: auto;
+  padding: 1px 5px;
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+#zen-threads-sidebar:hover .zen-ts-journal-btn,
+.zen-ts-journal-btn:focus-visible {
+  opacity: 0.85;
+}
+
+.zen-ts-journal-btn:hover {
+  opacity: 1;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+/* Tab salience: work outside the current thread quietly recedes. */
+.tabbrowser-tab[zen-thread-dimmed="true"] {
+  opacity: 0.58;
+  transition: opacity 0.35s ease;
+}
+
+.tabbrowser-tab[zen-thread-dimmed="true"]:hover {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tabbrowser-tab[zen-thread-dimmed="true"] {
+    transition: none;
+  }
+}
+
+/* Journal: browsing history as episodic memory. */
+.ztj-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.ztj-empty {
+  opacity: 0.6;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 46ch;
+}
+
+.ztj-day-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  opacity: 0.45;
+  margin-block-end: 8px;
+  padding-block-end: 6px;
+  border-block-end: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.ztj-block {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  transition: background 0.15s ease;
+}
+
+.ztj-block:hover {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+.ztj-time {
+  flex-shrink: 0;
+  width: 11ch;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+}
+
+.ztj-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ztj-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ztj-meta {
+  font-size: 11.5px;
+  opacity: 0.5;
+  margin-block-start: 2px;
+}
+
+.ztj-block .ztc-open {
+  margin-block-start: 0;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.ztj-block:hover .ztc-open,
+.ztj-block:focus-within .ztc-open {
+  opacity: 1;
 }
 
 .zen-ts-row {

@@ -1000,6 +1000,181 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
+  // -- journal ---------------------------------------------------------------
+
+  async #openJournal() {
+    const backdrop = document.getElementById("zen-threads-compare-backdrop");
+    const host = document.getElementById("zen-threads-compare");
+    if (!backdrop || !host) {
+      return;
+    }
+    const [days, { threads }] = await Promise.all([
+      ZenThreadsStorage.getJournal(),
+      ZenThreadsStorage.getSnapshot(),
+    ]);
+    const threadById = new Map(threads.map(t => [t.id, t]));
+
+    const header = document.createElementNS(XHTML_NS, "div");
+    header.className = "ztc-header";
+    const heading = document.createElementNS(XHTML_NS, "div");
+    heading.className = "ztc-heading";
+    heading.textContent = "Journal";
+    header.appendChild(heading);
+    const close = document.createElementNS(XHTML_NS, "button");
+    close.className = "ztc-close";
+    close.textContent = "✕";
+    close.setAttribute("aria-label", "Close journal");
+    close.addEventListener("click", () => this.#closeCompare());
+    header.appendChild(close);
+
+    const body = document.createElementNS(XHTML_NS, "div");
+    body.className = "ztj-body";
+
+    if (!days.length) {
+      const empty = document.createElementNS(XHTML_NS, "div");
+      empty.className = "ztj-empty";
+      empty.textContent =
+        "Nothing recorded yet. Once you work on something, it shows up here as sessions rather than a list of links.";
+      body.appendChild(empty);
+    }
+
+    for (const day of days) {
+      const daySection = document.createElementNS(XHTML_NS, "div");
+      daySection.className = "ztj-day";
+
+      const dayLabel = document.createElementNS(XHTML_NS, "div");
+      dayLabel.className = "ztj-day-label";
+      dayLabel.textContent = this.#dayLabel(day.dayStart);
+      daySection.appendChild(dayLabel);
+
+      for (const block of day.blocks) {
+        const row = document.createElementNS(XHTML_NS, "div");
+        row.className = "ztj-block";
+
+        const time = document.createElementNS(XHTML_NS, "div");
+        time.className = "ztj-time";
+        time.textContent = `${this.#clock(block.start)} – ${this.#clock(
+          block.end
+        )}`;
+        row.appendChild(time);
+
+        const main = document.createElementNS(XHTML_NS, "div");
+        main.className = "ztj-main";
+        const title = document.createElementNS(XHTML_NS, "div");
+        title.className = "ztj-title";
+        title.textContent = block.isSearch
+          ? `\u{1F50D} ${block.title}`
+          : block.title;
+        main.appendChild(title);
+        const meta = document.createElementNS(XHTML_NS, "div");
+        meta.className = "ztj-meta";
+        const minutes = Math.max(
+          1,
+          Math.round((block.end - block.start) / 60000)
+        );
+        meta.textContent = `${block.pages} page${
+          block.pages === 1 ? "" : "s"
+        } · ${minutes} min`;
+        main.appendChild(meta);
+        row.appendChild(main);
+
+        const resume = document.createElementNS(XHTML_NS, "button");
+        resume.className = "ztc-open";
+        resume.textContent = "Resume";
+        resume.addEventListener("click", () => {
+          const thread = threadById.get(block.threadId);
+          this.#closeCompare();
+          if (thread) {
+            this.#resumeThread(thread);
+          }
+        });
+        row.appendChild(resume);
+
+        daySection.appendChild(row);
+      }
+      body.appendChild(daySection);
+    }
+
+    host.replaceChildren(header, body);
+    backdrop.hidden = false;
+    backdrop.onclick = e => {
+      if (e.target === backdrop) {
+        this.#closeCompare();
+      }
+    };
+
+    const motion = window.gZenUIManager?.motion;
+    if (motion) {
+      motion.animate(backdrop, { opacity: [0, 1] }, { duration: 0.18 });
+      motion.animate(
+        host,
+        { opacity: [0, 1], transform: ["scale(0.97)", "scale(1)"] },
+        { duration: 0.24, bounce: 0 }
+      );
+    }
+  }
+
+  #resumeThread(thread) {
+    const liveTabs = this.#buildLiveMap();
+    let target = null;
+    const walk = nodes => {
+      for (const node of nodes) {
+        const entry = liveTabs.get(node.key);
+        if (entry) {
+          if (!target || node.lastTs > target.lastTs) {
+            target = { entry, lastTs: node.lastTs };
+          }
+        } else if (
+          /^https?:/.test(node.url) &&
+          (!target || node.lastTs > target.lastTs)
+        ) {
+          target = { node, lastTs: node.lastTs };
+        }
+        if (node.children.length) {
+          walk(node.children);
+        }
+      }
+    };
+    walk(thread.roots);
+    if (!target) {
+      return;
+    }
+    if (target.entry) {
+      target.entry.win.focus();
+      target.entry.win.gBrowser.selectedTab = target.entry.tab;
+    } else {
+      this.#reopen(target.node);
+    }
+  }
+
+  #dayLabel(dayStart) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((today.getTime() - dayStart) / 86400000);
+    if (diffDays === 0) {
+      return "Today";
+    }
+    if (diffDays === 1) {
+      return "Yesterday";
+    }
+    const date = new Date(dayStart);
+    if (diffDays < 7) {
+      return date.toLocaleDateString(undefined, { weekday: "long" });
+    }
+    return date.toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+    });
+  }
+
+  #clock(ts) {
+    return new Date(ts).toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
   // -- compare mode ----------------------------------------------------------
 
   /**
@@ -1312,6 +1487,33 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
+  /**
+   * Salience should track attention (idea1 §15): while you are working
+   * inside a thread, tabs that belong to other work recede slightly. Kept
+   * deliberately subtle, skipped for pinned/app tabs, and only when the
+   * current thread actually has company.
+   */
+  #applyTabSalience(threadKeys) {
+    if (
+      !Services.prefs.getBoolPref("zen.threads.dim-unrelated-tabs", true)
+    ) {
+      return;
+    }
+    const active = threadKeys && threadKeys.size >= 2;
+    for (const tab of gBrowser.tabs) {
+      let dim = false;
+      if (active && !tab.pinned && !tab.selected) {
+        const key = this.#tabKeys.get(tab);
+        dim = !key || !threadKeys.has(key);
+      }
+      if (dim) {
+        tab.setAttribute("zen-thread-dimmed", "true");
+      } else {
+        tab.removeAttribute("zen-thread-dimmed");
+      }
+    }
+  }
+
   #onSidebarKeydown(event) {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
       return;
@@ -1360,7 +1562,24 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     ]);
     const liveTabs = this.#buildLiveMap();
     const selKey = this.#tabKeys.get(gBrowser.selectedTab);
-    const selRoot = selKey ? this.#rootKeyOf(selKey) : null;
+    const selRoot = selKey ? nodeThread.get(selKey) ?? this.#rootKeyOf(selKey) : null;
+
+    // Tabs belonging to the thread currently in focus.
+    const activeThread = threads.find(t => t.id === selRoot);
+    let threadKeys = null;
+    if (activeThread) {
+      threadKeys = new Set();
+      const collect = nodes => {
+        for (const node of nodes) {
+          threadKeys.add(node.key);
+          if (node.children.length) {
+            collect(node.children);
+          }
+        }
+      };
+      collect(activeThread.roots);
+    }
+    this.#applyTabSalience(threadKeys);
 
     el.replaceChildren();
     if (!threads.length && !shelf.length) {
@@ -1369,7 +1588,19 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     const header = document.createElementNS(XHTML_NS, "div");
     header.className = "zen-ts-header";
-    header.textContent = "Threads";
+    const headerLabel = document.createElementNS(XHTML_NS, "span");
+    headerLabel.textContent = "Threads";
+    header.appendChild(headerLabel);
+    const journalBtn = document.createElementNS(XHTML_NS, "button");
+    journalBtn.className = "zen-ts-journal-btn";
+    journalBtn.textContent = "Journal";
+    journalBtn.title = "Journal — your browsing as sessions of work";
+    journalBtn.addEventListener("click", () =>
+      this.#openJournal().catch(e =>
+        console.error("ZenThreads: journal failed", e)
+      )
+    );
+    header.appendChild(journalBtn);
     el.appendChild(header);
 
     const visible = threads

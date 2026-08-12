@@ -732,6 +732,90 @@ export const ZenThreadsStorage = new (class {
     return value;
   }
 
+  /**
+   * History as episodic memory: activity grouped into sessions of work on a
+   * thread, rather than a flat list of URLs.
+   *
+   * Returns [{ dayStart, blocks: [{ threadId, title, isSearch, start, end,
+   * pages }] }], most recent day first.
+   */
+  async getJournal(days = 14) {
+    await this.#dbReady;
+    await this.#writeQueue;
+    if (!this.#db) {
+      return [];
+    }
+    const { nodeThread, threads } = await this.getSnapshot();
+    const titleById = new Map(
+      threads.map(thread => [
+        thread.id,
+        { title: thread.title, isSearch: thread.isSearch },
+      ])
+    );
+
+    let rows;
+    try {
+      rows = await this.#db.execute(
+        `SELECT ts, tab, url FROM events
+         WHERE kind = 'nav' AND ts > :cutoff ORDER BY ts ASC`,
+        { cutoff: Date.now() - days * 86400000 }
+      );
+    } catch (e) {
+      console.error("ZenThreadsStorage: journal query failed", e);
+      return [];
+    }
+
+    const GAP_MS = 30 * 60 * 1000;
+    const blocks = [];
+    let current = null;
+    for (const row of rows) {
+      const tab = row.getResultByName("tab");
+      const threadId = nodeThread.get(tab);
+      if (!threadId) {
+        continue; // app pages and sub-threshold noise stay out of the journal
+      }
+      const ts = row.getResultByName("ts");
+      const url = row.getResultByName("url");
+      if (
+        current &&
+        current.threadId === threadId &&
+        ts - current.end <= GAP_MS
+      ) {
+        current.end = ts;
+        current.urls.add(url);
+      } else {
+        current = { threadId, start: ts, end: ts, urls: new Set([url]) };
+        blocks.push(current);
+      }
+    }
+
+    const byDay = new Map();
+    for (const block of blocks) {
+      const date = new Date(block.start);
+      date.setHours(0, 0, 0, 0);
+      const dayStart = date.getTime();
+      if (!byDay.has(dayStart)) {
+        byDay.set(dayStart, []);
+      }
+      const meta = titleById.get(block.threadId);
+      byDay.get(dayStart).push({
+        threadId: block.threadId,
+        title: meta?.title ?? "Untitled thread",
+        isSearch: !!meta?.isSearch,
+        start: block.start,
+        end: block.end,
+        pages: block.urls.size,
+      });
+    }
+
+    return [...byDay.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .map(([dayStart, dayBlocks]) => ({
+        dayStart,
+        blocks: dayBlocks.sort((a, b) => a.start - b.start),
+      }));
+  }
+
   #titleFor(root) {
     if (root.isSearch && root.query) {
       return root.query;
