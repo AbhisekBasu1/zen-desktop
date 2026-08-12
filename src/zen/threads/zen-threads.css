@@ -251,12 +251,15 @@
 
 /* Return card: a brief, calm reminder of a suspended intention. */
 #zen-threads-return-card {
-  position: fixed;
-  inset-block-start: 64px;
+  /* Absolute, not fixed: the mount point (#tabbrowser-tabbox) is the
+     content rectangle, so the card centres over the page rather than the
+     whole window — matching how the split-view overlay positions itself. */
+  position: absolute;
+  inset-block-start: 18px;
   inset-inline: 0;
   margin-inline: auto;
   width: max-content;
-  max-width: min(420px, 72vw);
+  max-width: min(420px, 72%);
   z-index: 2147483601;
   padding: 12px 18px 13px;
   border-radius: 14px;
@@ -266,7 +269,6 @@
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.08),
     0 12px 40px rgba(0, 0, 0, 0.22);
-  backdrop-filter: blur(18px) saturate(1.4);
   cursor: default;
   user-select: none;
 }

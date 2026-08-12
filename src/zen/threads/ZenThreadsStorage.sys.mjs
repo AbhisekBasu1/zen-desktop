@@ -64,6 +64,17 @@ export const ZenThreadsStorage = new (class {
   #snapshotCache = null;
   #shelfCache = null;
   #checkpointCache = null;
+  #metaCache = null;
+
+  // Incrementally folded state: the append-only log replayed once, then
+  // advanced by cursor. Holds scalars only — the derived projection with
+  // its parent/child links is rebuilt separately so folding can never
+  // corrupt it.
+  #nodes = new Map();
+  #hostDays = new Map();
+  #maxEventId = 0;
+  #foldedSeq = -1;
+  #graphCache = null;
 
   constructor() {
     this.#dbReady = this.#open();
@@ -152,10 +163,52 @@ export const ZenThreadsStorage = new (class {
         "ZenThreadsStorage: closing connection",
         this.#shutdownBlocker
       );
+      // Places schedules its own maintenance the same way; the log is only
+      // read through a window, so anything older than that is dead weight.
+      Services.obs.addObserver(this, "idle-daily");
     } catch (e) {
       console.error("ZenThreadsStorage: open failed", e);
       this.#db = null;
     }
+  }
+
+  observe(subject, topic) {
+    if (topic === "idle-daily") {
+      this.#sweep();
+    }
+  }
+
+  /**
+   * Retention: the read window is finite, so events older than it can never
+   * influence anything again. Resolved shelf entries age out the same way.
+   */
+  #sweep() {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      const cutoff = Date.now() - SNAPSHOT_WINDOW_MS;
+      try {
+        await this.#db.execute("DELETE FROM events WHERE ts < :cutoff", {
+          cutoff,
+        });
+        await this.#db.execute(
+          `DELETE FROM shelf
+           WHERE resolved_ts IS NOT NULL AND resolved_ts < :cutoff`,
+          { cutoff }
+        );
+        // Folded state may now describe deleted rows; rebuild it lazily.
+        this.#nodes = new Map();
+        this.#hostDays = new Map();
+        this.#maxEventId = 0;
+        this.#foldedSeq = -1;
+        this.#graphCache = null;
+        this.#snapshotCache = null;
+      } catch (e) {
+        console.error("ZenThreadsStorage: retention sweep failed", e);
+      }
+    });
   }
 
   recordEvent(kind, tabKey, parentKey, url, title, query) {
@@ -266,7 +319,10 @@ export const ZenThreadsStorage = new (class {
   }
 
   async getShelf(limit = 30) {
-    if (this.#shelfCache?.key === `${this.#shelfRev}:${limit}`) {
+    // Capture the revision before awaiting: a write landing during the await
+    // must not let us stamp stale rows as current.
+    const cacheKey = `${this.#shelfRev}:${limit}`;
+    if (this.#shelfCache?.key === cacheKey) {
       return this.#shelfCache.value;
     }
     await this.#dbReady;
@@ -293,7 +349,7 @@ export const ZenThreadsStorage = new (class {
     } catch (e) {
       console.error("ZenThreadsStorage: getShelf failed", e);
     }
-    this.#shelfCache = { key: `${this.#shelfRev}:${limit}`, value: items };
+    this.#shelfCache = { key: cacheKey, value: items };
     return items;
   }
 
@@ -330,7 +386,8 @@ export const ZenThreadsStorage = new (class {
   }
 
   async getCheckpoints() {
-    if (this.#checkpointCache?.key === this.#checkpointRev) {
+    const cacheKey = this.#checkpointRev;
+    if (this.#checkpointCache?.key === cacheKey) {
       return this.#checkpointCache.value;
     }
     await this.#dbReady;
@@ -354,7 +411,7 @@ export const ZenThreadsStorage = new (class {
     } catch (e) {
       console.error("ZenThreadsStorage: getCheckpoints failed", e);
     }
-    this.#checkpointCache = { key: this.#checkpointRev, value: map };
+    this.#checkpointCache = { key: cacheKey, value: map };
     return map;
   }
 
@@ -433,6 +490,10 @@ export const ZenThreadsStorage = new (class {
   }
 
   async #getThreadMeta() {
+    const cacheKey = this.#metaRev;
+    if (this.#metaCache?.key === cacheKey) {
+      return this.#metaCache.value;
+    }
     const map = new Map();
     if (!this.#db) {
       return map;
@@ -451,6 +512,7 @@ export const ZenThreadsStorage = new (class {
     } catch (e) {
       console.error("ZenThreadsStorage: thread meta failed", e);
     }
+    this.#metaCache = { key: cacheKey, value: map };
     return map;
   }
 
@@ -464,37 +526,103 @@ export const ZenThreadsStorage = new (class {
    * "loose" holds nodes of components below the thread threshold.
    */
   async getSnapshot() {
-    // Deriving the graph is the expensive path; skip it entirely when
-    // nothing that feeds it has changed since the last derivation.
-    // Tiers depend on elapsed time, so let the cache lapse every few minutes
-    // even when nothing was written.
+    // The whole read is layered so the hot path stays cheap:
+    //   1. fold   — replay only events recorded since the last call
+    //   2. derive — rebuild the parent/child projection, cached on the log
+    //               cursor and manual merge links
+    //   3. meta   — apply renames/status and recompute time-based tiers,
+    //               cheap enough to run on every call
     const timeBucket = Math.floor(Date.now() / 300000);
     const cacheKey = `${this.#eventSeq}:${this.#linkRev}:${this.#metaRev}:${timeBucket}`;
     if (this.#snapshotCache?.key === cacheKey) {
       return this.#snapshotCache.value;
     }
     await this.#dbReady;
-    // Wait for pending writes so the snapshot reflects this session so far.
-    await this.#writeQueue;
     if (!this.#db) {
       return { threads: [], loose: [], nodeThread: new Map() };
     }
+    await this.#advanceFold();
+
+    const graphKey = `${this.#maxEventId}:${this.#linkRev}`;
+    let graph;
+    if (this.#graphCache?.key === graphKey) {
+      graph = this.#graphCache.value;
+    } else {
+      graph = this.#deriveGraph(await this.#getThreadLinks());
+      this.#graphCache = { key: graphKey, value: graph };
+    }
+
+    const meta = await this.#getThreadMeta();
+    const now = Date.now();
+    const threads = graph.shells.map(shell => {
+      const m = meta.get(shell.id);
+      const renamed = m?.title;
+      // Fresh activity always reactivates a thread marked done.
+      const done = m?.status === "done" && (m.statusTs ?? 0) >= shell.lastTs;
+      const age = now - shell.lastTs;
+      return {
+        id: shell.id,
+        title: renamed || shell.title,
+        isSearch: renamed ? false : shell.isSearch,
+        lastTs: shell.lastTs,
+        roots: shell.roots,
+        done,
+        tier: done
+          ? "archived"
+          : age > ARCHIVE_MS
+            ? "archived"
+            : age > RECEDE_MS
+              ? "receded"
+              : "recent",
+      };
+    });
+
+    const value = {
+      threads: threads.slice(0, MAX_THREADS),
+      loose: graph.loose,
+      nodeThread: graph.nodeThread,
+    };
+    this.#snapshotCache = { key: cacheKey, value };
+    return value;
+  }
+
+  /**
+   * Replay events recorded since the last fold into scalar node state.
+   * Safe as an incremental fold because every event touches exactly one
+   * node, firstTs is write-once, and everything else is last-write-wins.
+   * AUTOINCREMENT guarantees ids are never reused, so the cursor cannot
+   * skip rows after a retention sweep.
+   */
+  async #advanceFold() {
+    if (this.#foldedSeq === this.#eventSeq) {
+      return; // nothing recorded since the last fold
+    }
+    // Only wait on pending writes when there is something to wait for.
+    await this.#writeQueue;
+    const seqAtRead = this.#eventSeq;
+
+    const nodes = this.#nodes;
+    const hostDays = this.#hostDays;
+    const first = this.#maxEventId === 0;
 
     let rows;
     try {
-      rows = await this.#db.execute(
-        `SELECT ts, kind, tab, parent, url, title, search_query
-         FROM events WHERE ts > :cutoff ORDER BY id ASC`,
-        { cutoff: Date.now() - SNAPSHOT_WINDOW_MS }
-      );
+      rows = first
+        ? await this.#db.execute(
+            `SELECT id, ts, kind, tab, parent, url, title, search_query
+             FROM events WHERE ts > :cutoff ORDER BY id ASC`,
+            { cutoff: Date.now() - SNAPSHOT_WINDOW_MS }
+          )
+        : await this.#db.execute(
+            `SELECT id, ts, kind, tab, parent, url, title, search_query
+             FROM events WHERE id > :sinceId ORDER BY id ASC`,
+            { sinceId: this.#maxEventId }
+          );
     } catch (e) {
-      console.error("ZenThreadsStorage: snapshot query failed", e);
-      return { threads: [], loose: [] };
+      console.error("ZenThreadsStorage: fold query failed", e);
+      return;
     }
 
-    // Fold the log into per-tab node state.
-    const nodes = new Map(); // key -> node
-    const hostDays = new Map(); // host -> Set(day) for app detection
     const nodeFor = key => {
       let node = nodes.get(key);
       if (!node) {
@@ -508,7 +636,6 @@ export const ZenThreadsStorage = new (class {
           closed: true,
           firstTs: 0,
           lastTs: 0,
-          children: [],
         };
         nodes.set(key, node);
       }
@@ -516,6 +643,10 @@ export const ZenThreadsStorage = new (class {
     };
 
     for (const row of rows) {
+      const id = row.getResultByName("id");
+      if (id > this.#maxEventId) {
+        this.#maxEventId = id;
+      }
       const kind = row.getResultByName("kind");
       const key = row.getResultByName("tab");
       const ts = row.getResultByName("ts");
@@ -577,7 +708,22 @@ export const ZenThreadsStorage = new (class {
       }
     }
 
+    this.#foldedSeq = seqAtRead;
+  }
+
+  /**
+   * Rebuild the parent/child projection from folded state. Always builds
+   * fresh node objects, so it can be re-run any number of times without
+   * corrupting the fold. Returns { shells, loose, nodeThread }.
+   */
+  #deriveGraph(links) {
+    const nodes = new Map();
+    for (const [key, folded] of this.#nodes) {
+      nodes.set(key, { ...folded, children: [] });
+    }
+
     // Mark app nodes: they live outside the thread model entirely.
+    const hostDays = this.#hostDays;
     const isAppHost = host =>
       APP_SEED_HOSTS.has(host) ||
       (hostDays.get(host)?.size ?? 0) >= APP_MIN_DAYS;
@@ -610,13 +756,29 @@ export const ZenThreadsStorage = new (class {
         node.parent = null;
       }
     }
+    const rootMemo = new Map();
     const rootOf = node => {
+      const cached = rootMemo.get(node.key);
+      if (cached) {
+        return cached;
+      }
       let cur = node;
+      const path = [];
       const seen = new Set();
       while (cur.parent && nodes.has(cur.parent) && !seen.has(cur.key)) {
         seen.add(cur.key);
+        path.push(cur);
         cur = nodes.get(cur.parent);
+        const memo = rootMemo.get(cur.key);
+        if (memo) {
+          cur = memo;
+          break;
+        }
       }
+      for (const visited of path) {
+        rootMemo.set(visited.key, cur);
+      }
+      rootMemo.set(cur.key, cur);
       return cur;
     };
 
@@ -639,7 +801,6 @@ export const ZenThreadsStorage = new (class {
 
     // Apply manual merge links: union linked components (two passes to
     // resolve chains).
-    const links = await this.#getThreadLinks();
     for (let pass = 0; pass < 2; pass++) {
       for (const [a, b] of links) {
         const ca = components.get(a);
@@ -660,7 +821,7 @@ export const ZenThreadsStorage = new (class {
     }
     const seenComps = new Set();
 
-    const threads = [];
+    const shells = [];
     const loose = [];
     for (const comp of components.values()) {
       if (seenComps.has(comp)) {
@@ -680,7 +841,7 @@ export const ZenThreadsStorage = new (class {
         loose.push(...comp.members.filter(n => !n.parent));
         continue;
       }
-      threads.push({
+      shells.push({
         id: comp.root.key,
         title: this.#titleFor(comp.root),
         isSearch: comp.root.isSearch,
@@ -689,47 +850,25 @@ export const ZenThreadsStorage = new (class {
       });
     }
 
-    const meta = await this.#getThreadMeta();
-    const now = Date.now();
-    for (const thread of threads) {
-      const m = meta.get(thread.id);
-      if (m?.title) {
-        thread.title = m.title;
-        thread.isSearch = false;
-      }
-      // Lifecycle tier. Fresh activity always reactivates a done thread.
-      const done = m?.status === "done" && (m.statusTs ?? 0) >= thread.lastTs;
-      const age = now - thread.lastTs;
-      thread.done = done;
-      thread.tier = done
-        ? "archived"
-        : age > ARCHIVE_MS
-          ? "archived"
-          : age > RECEDE_MS
-            ? "receded"
-            : "recent";
-    }
-
-    threads.sort((a, b) => b.lastTs - a.lastTs);
+    shells.sort((a, b) => b.lastTs - a.lastTs);
     loose.sort((a, b) => b.lastTs - a.lastTs);
+
     // Reverse index so callers can ask which thread a page belongs to
     // (used to resurface shelf items alongside their thread).
     const nodeThread = new Map();
-    const indexNodes = (nodes, threadId) => {
-      for (const node of nodes) {
+    const indexNodes = (list, threadId) => {
+      for (const node of list) {
         nodeThread.set(node.key, threadId);
         if (node.children.length) {
           indexNodes(node.children, threadId);
         }
       }
     };
-    for (const thread of threads) {
-      indexNodes(thread.roots, thread.id);
+    for (const shell of shells) {
+      indexNodes(shell.roots, shell.id);
     }
 
-    const value = { threads: threads.slice(0, MAX_THREADS), loose, nodeThread };
-    this.#snapshotCache = { key: cacheKey, value };
-    return value;
+    return { shells, loose, nodeThread };
   }
 
   /**

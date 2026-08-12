@@ -1141,7 +1141,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
     };
 
-    const motion = window.gZenUIManager?.motion;
+    const motion = this.#prefersReducedMotion()
+      ? null
+      : window.gZenUIManager?.motion;
     if (motion) {
       motion.animate(backdrop, { opacity: [0, 1] }, { duration: 0.18 });
       motion.animate(
@@ -1343,7 +1345,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
     };
 
-    const motion = window.gZenUIManager?.motion;
+    const motion = this.#prefersReducedMotion()
+      ? null
+      : window.gZenUIManager?.motion;
     if (motion) {
       motion.animate(backdrop, { opacity: [0, 1] }, { duration: 0.18 });
       motion.animate(
@@ -1364,7 +1368,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       backdrop.hidden = true;
       host?.replaceChildren();
     };
-    const motion = window.gZenUIManager?.motion;
+    const motion = this.#prefersReducedMotion()
+      ? null
+      : window.gZenUIManager?.motion;
     if (motion) {
       motion
         .animate(backdrop, { opacity: [1, 0] }, { duration: 0.16 })
@@ -1446,7 +1452,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     card.replaceChildren(label, heading, body);
     card.hidden = false;
 
-    const motion = window.gZenUIManager?.motion;
+    // Motion drives WAAPI, which does not consult prefers-reduced-motion,
+    // so honour it here.
+    const motion = this.#prefersReducedMotion()
+      ? null
+      : window.gZenUIManager?.motion;
     if (motion) {
       motion.animate(
         card,
@@ -1493,6 +1503,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         .then(finish, finish);
     } else {
       finish();
+    }
+  }
+
+  #prefersReducedMotion() {
+    try {
+      return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch (e) {
+      return false;
     }
   }
 
