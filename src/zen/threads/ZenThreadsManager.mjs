@@ -49,6 +49,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #sidebarRefreshTimer = null;
   #expandedSidebarThreads = new Set();
   #showArchived = false;
+  #mergeSource = null; // thread id armed for merging
 
   init() {
     try {
@@ -585,6 +586,31 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       (gBrowser.tabGroups || []).find(
         g => g.id === folderId && g.isZenFolder
       );
+    if (thread.id === this.#mergeSource) {
+      section.classList.add("zen-thread-merge-armed");
+    }
+    const merge = document.createElementNS(XHTML_NS, "span");
+    merge.className = "zen-thread-done-btn zen-thread-merge-btn";
+    merge.textContent = "⇆";
+    merge.title =
+      this.#mergeSource && this.#mergeSource !== thread.id
+        ? "Merge the armed thread into this one"
+        : "Merge: arm this thread, then click ⇆ on the destination";
+    merge.addEventListener("click", e => {
+      e.stopPropagation();
+      if (!this.#mergeSource) {
+        this.#mergeSource = thread.id;
+      } else if (this.#mergeSource === thread.id) {
+        this.#mergeSource = null;
+      } else {
+        ZenThreadsStorage.linkThreads(thread.id, this.#mergeSource);
+        this.#mergeSource = null;
+        this.#queueSidebarRefresh();
+      }
+      this.#render().catch(() => {});
+    });
+    header.appendChild(merge);
+
     const done = document.createElementNS(XHTML_NS, "span");
     done.className = "zen-thread-done-btn";
     done.textContent = thread.done ? "↺" : "✓";
@@ -950,6 +976,30 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       time.className = "zen-ts-time";
       time.textContent = this.#relativeTime(thread.lastTs);
       row.appendChild(time);
+      if (thread.id === this.#mergeSource) {
+        row.classList.add("zen-thread-merge-armed");
+      }
+      const merge = document.createElementNS(XHTML_NS, "span");
+      merge.className = "zen-thread-done-btn zen-thread-merge-btn";
+      merge.textContent = "⇆";
+      merge.title =
+        this.#mergeSource && this.#mergeSource !== thread.id
+          ? "Merge the armed thread into this one"
+          : "Merge: arm this thread, then click ⇆ on the destination";
+      merge.addEventListener("click", e => {
+        e.stopPropagation();
+        if (!this.#mergeSource) {
+          this.#mergeSource = thread.id;
+        } else if (this.#mergeSource === thread.id) {
+          this.#mergeSource = null;
+        } else {
+          ZenThreadsStorage.linkThreads(thread.id, this.#mergeSource);
+          this.#mergeSource = null;
+        }
+        this.#refreshSidebar().catch(() => {});
+      });
+      row.appendChild(merge);
+
       const done = document.createElementNS(XHTML_NS, "span");
       done.className = "zen-thread-done-btn";
       done.textContent = "✓";

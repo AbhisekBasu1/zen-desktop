@@ -112,6 +112,14 @@ export const ZenThreadsStorage = new (class {
           title TEXT
         )
       `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS thread_links (
+          a TEXT NOT NULL,
+          b TEXT NOT NULL,
+          ts INTEGER NOT NULL,
+          PRIMARY KEY (a, b)
+        )
+      `);
       for (const col of ["status TEXT", "status_ts INTEGER"]) {
         try {
           await db.execute(`ALTER TABLE thread_meta ADD COLUMN ${col}`);
@@ -342,6 +350,40 @@ export const ZenThreadsStorage = new (class {
     });
   }
 
+  linkThreads(a, b) {
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT OR REPLACE INTO thread_links (a, b, ts)
+           VALUES (:a, :b, :ts)`,
+          { a, b, ts: Date.now() }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: linkThreads failed", e);
+      }
+    });
+  }
+
+  async #getThreadLinks() {
+    const links = [];
+    if (!this.#db) {
+      return links;
+    }
+    try {
+      const rows = await this.#db.execute("SELECT a, b FROM thread_links");
+      for (const row of rows) {
+        links.push([row.getResultByName("a"), row.getResultByName("b")]);
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: getThreadLinks failed", e);
+    }
+    return links;
+  }
+
   setThreadStatus(threadId, status) {
     this.#writeQueue = this.#writeQueue.then(async () => {
       await this.#dbReady;
@@ -557,9 +599,36 @@ export const ZenThreadsStorage = new (class {
       comp.firstTs = Math.min(comp.firstTs, node.firstTs);
     }
 
+    // Apply manual merge links: union linked components (two passes to
+    // resolve chains).
+    const links = await this.#getThreadLinks();
+    for (let pass = 0; pass < 2; pass++) {
+      for (const [a, b] of links) {
+        const ca = components.get(a);
+        const cb = components.get(b);
+        if (ca && cb && ca !== cb) {
+          ca.members.push(...cb.members);
+          ca.lastTs = Math.max(ca.lastTs, cb.lastTs);
+          ca.firstTs = Math.min(ca.firstTs, cb.firstTs);
+          cb.root.parent = null;
+          if (!ca.root.children.includes(cb.root)) {
+            ca.root.children.push(cb.root);
+          }
+          components.delete(b);
+          components.set(b, ca);
+          components.set(a, ca);
+        }
+      }
+    }
+    const seenComps = new Set();
+
     const threads = [];
     const loose = [];
     for (const comp of components.values()) {
+      if (seenComps.has(comp)) {
+        continue;
+      }
+      seenComps.add(comp);
       const span = comp.lastTs - comp.firstTs;
       const hasSearchRoot = comp.root.isSearch;
       // Empty new-tab chains must never become threads.

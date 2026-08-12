@@ -360,6 +360,16 @@
   opacity: 0.6;
 }
 
+.zen-thread-merge-armed {
+  outline: 1.5px solid color-mix(in srgb, currentColor 35%, transparent);
+  outline-offset: -1px;
+  border-radius: 8px;
+}
+
+.zen-thread-merge-armed .zen-thread-merge-btn {
+  opacity: 1 !important;
+}
+
 .zen-threads-archived-toggle {
   margin-top: 6px;
   padding: 4px 6px;
