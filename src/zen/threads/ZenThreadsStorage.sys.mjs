@@ -6,9 +6,19 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   Sqlite: "resource://gre/modules/Sqlite.sys.mjs",
   AsyncShutdown: "resource://gre/modules/AsyncShutdown.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
 });
 
-const SNAPSHOT_WINDOW_MS = 120 * 24 * 60 * 60 * 1000; // wide, so threads age out whole
+const DEFAULT_RETENTION_DAYS = 120;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function retentionWindowMs() {
+  const days = Services.prefs.getIntPref(
+    "zen.threads.retention-days",
+    DEFAULT_RETENTION_DAYS
+  );
+  return Math.max(1, days) * DAY_MS;
+}
 const RECEDE_MS = 48 * 60 * 60 * 1000; // inactive 48h -> receded
 const ARCHIVE_MS = 14 * 24 * 60 * 60 * 1000; // inactive 14d -> archived
 const MAX_THREADS = 50;
@@ -166,6 +176,14 @@ export const ZenThreadsStorage = new (class {
       // Places schedules its own maintenance the same way; the log is only
       // read through a window, so anything older than that is dead weight.
       Services.obs.addObserver(this, "idle-daily");
+      // Forgetting must be honoured: a provenance log that survives Clear
+      // History would be a shadow history the user cannot see or erase.
+      this.handlePlacesEvents = this.handlePlacesEvents.bind(this);
+      lazy.PlacesUtils.observers.addListener(
+        ["history-cleared", "page-removed"],
+        this.handlePlacesEvents
+      );
+      Services.obs.addObserver(this, "browser:purge-session-history");
     } catch (e) {
       console.error("ZenThreadsStorage: open failed", e);
       this.#db = null;
@@ -175,7 +193,116 @@ export const ZenThreadsStorage = new (class {
   observe(subject, topic) {
     if (topic === "idle-daily") {
       this.#sweep();
+    } else if (topic === "browser:purge-session-history") {
+      this.forgetEverything();
     }
+  }
+
+  handlePlacesEvents(events) {
+    if (!Services.prefs.getBoolPref("zen.threads.clear-with-history", true)) {
+      return;
+    }
+    for (const event of events) {
+      if (event.type === "history-cleared") {
+        this.forgetEverything();
+      } else if (event.type === "page-removed" && event.url) {
+        this.forgetUrl(event.url);
+      }
+    }
+  }
+
+  /** Drop everything. Used when the user clears their browsing history. */
+  forgetEverything() {
+    this.#eventSeq++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        for (const table of [
+          "events",
+          "shelf",
+          "checkpoints",
+          "thread_meta",
+          "thread_links",
+          "thread_folders",
+        ]) {
+          await this.#db.execute(`DELETE FROM ${table}`);
+        }
+        this.#resetDerived();
+      } catch (e) {
+        console.error("ZenThreadsStorage: forgetEverything failed", e);
+      }
+    });
+  }
+
+  /** Drop every trace of one page, wherever it appears. */
+  forgetUrl(url) {
+    this.#eventSeq++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute("DELETE FROM events WHERE url = :url", { url });
+        await this.#db.execute("DELETE FROM shelf WHERE url = :url", { url });
+        this.#resetDerived();
+      } catch (e) {
+        console.error("ZenThreadsStorage: forgetUrl failed", e);
+      }
+    });
+  }
+
+  /** Drop one thread and everything recorded under it. */
+  forgetThread(threadId, memberKeys = []) {
+    this.#eventSeq++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        for (const key of memberKeys) {
+          await this.#db.execute("DELETE FROM events WHERE tab = :key", { key });
+          await this.#db.execute("DELETE FROM shelf WHERE tab_key = :key", {
+            key,
+          });
+        }
+        await this.#db.execute(
+          "DELETE FROM checkpoints WHERE thread_id = :id",
+          { id: threadId }
+        );
+        await this.#db.execute("DELETE FROM thread_meta WHERE thread_id = :id", {
+          id: threadId,
+        });
+        await this.#db.execute(
+          "DELETE FROM thread_links WHERE a = :id OR b = :id",
+          { id: threadId }
+        );
+        await this.#db.execute(
+          "DELETE FROM thread_folders WHERE thread_id = :id",
+          { id: threadId }
+        );
+        this.#resetDerived();
+      } catch (e) {
+        console.error("ZenThreadsStorage: forgetThread failed", e);
+      }
+    });
+  }
+
+  /** Folded state describes rows that may no longer exist; rebuild lazily. */
+  #resetDerived() {
+    this.#nodes = new Map();
+    this.#hostDays = new Map();
+    this.#maxEventId = 0;
+    this.#foldedSeq = -1;
+    this.#graphCache = null;
+    this.#snapshotCache = null;
+    this.#shelfCache = null;
+    this.#checkpointCache = null;
+    this.#metaCache = null;
   }
 
   /**
@@ -188,7 +315,7 @@ export const ZenThreadsStorage = new (class {
       if (!this.#db) {
         return;
       }
-      const cutoff = Date.now() - SNAPSHOT_WINDOW_MS;
+      const cutoff = Date.now() - retentionWindowMs();
       try {
         await this.#db.execute("DELETE FROM events WHERE ts < :cutoff", {
           cutoff,
@@ -198,13 +325,7 @@ export const ZenThreadsStorage = new (class {
            WHERE resolved_ts IS NOT NULL AND resolved_ts < :cutoff`,
           { cutoff }
         );
-        // Folded state may now describe deleted rows; rebuild it lazily.
-        this.#nodes = new Map();
-        this.#hostDays = new Map();
-        this.#maxEventId = 0;
-        this.#foldedSeq = -1;
-        this.#graphCache = null;
-        this.#snapshotCache = null;
+        this.#resetDerived();
       } catch (e) {
         console.error("ZenThreadsStorage: retention sweep failed", e);
       }
@@ -636,7 +757,7 @@ export const ZenThreadsStorage = new (class {
         ? await this.#db.execute(
             `SELECT id, ts, kind, tab, parent, url, title, search_query
              FROM events WHERE ts > :cutoff ORDER BY id ASC`,
-            { cutoff: Date.now() - SNAPSHOT_WINDOW_MS }
+            { cutoff: Date.now() - retentionWindowMs() }
           )
         : await this.#db.executeCached(
             `SELECT id, ts, kind, tab, parent, url, title, search_query

@@ -1,0 +1,29 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# Master switch. When false, nothing is recorded and no Threads UI appears.
+- name: zen.threads.enabled
+  value: true
+
+# Tabs belonging to other work recede slightly while you are inside a thread.
+- name: zen.threads.dim-unrelated-tabs
+  value: true
+
+# How long a thread must have been untouched before returning to it shows
+# the "where you left off" card.
+- name: zen.threads.return-card.min-away-seconds
+  value: 7200
+
+# How long the provenance log is kept, in days. Anything older is swept.
+- name: zen.threads.retention-days
+  value: 120
+
+# Clear the provenance log whenever browsing history is cleared.
+- name: zen.threads.clear-with-history
+  value: true
+
+# A page seen in this many separate threads becomes a Reference: kept out of
+# comparisons and never closed when a thread is marked done.
+- name: zen.threads.reference-thread-count
+  value: 2

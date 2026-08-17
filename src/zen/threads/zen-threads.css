@@ -466,6 +466,10 @@
   background: var(--zen-toolbar-element-bg-hover, color-mix(in srgb, currentColor 12%, transparent));
 }
 
+.zen-thread-forget-btn:hover {
+  background: color-mix(in srgb, #d13438 22%, transparent) !important;
+}
+
 .zen-thread-compare-btn {
   font-variant-numeric: tabular-nums;
   font-size: 0.9em;

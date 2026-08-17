@@ -67,6 +67,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       if (lazy.PrivateBrowsingUtils.isWindowPrivate(window)) {
         return;
       }
+      if (!Services.prefs.getBoolPref("zen.threads.enabled", true)) {
+        return;
+      }
       window.addEventListener("unload", this, { once: true });
       // gBrowser does not exist yet at DOMContentLoaded — wait for the
       // window's delayed startup before touching tabs.
@@ -1026,6 +1029,34 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
    * Done path must include pinned ones or it would find nothing to close
    * once a thread has been grouped into a folder.
    */
+  #collectKeys(nodes, out = []) {
+    for (const node of nodes) {
+      out.push(node.key);
+      if (node.children.length) {
+        this.#collectKeys(node.children, out);
+      }
+    }
+    return out;
+  }
+
+  #forgetThread(thread, liveTabs) {
+    const keys = this.#collectKeys(thread.roots);
+    const tabs = [];
+    this.#collectLiveTabs(thread.roots, liveTabs, tabs, {
+      includePinned: true,
+    });
+    for (const tab of tabs) {
+      try {
+        gBrowser.removeTab(tab, { animate: true });
+      } catch (e) {
+        // Tab already gone.
+      }
+    }
+    ZenThreadsStorage.forgetThread(thread.id, keys);
+    this.#queueSidebarRefresh();
+    setTimeout(() => this.#render().catch(() => {}), 150);
+  }
+
   #collectLiveTabs(nodes, liveTabs, out, { includePinned = false } = {}) {
     for (const node of nodes) {
       const entry = liveTabs.get(node.key);
@@ -1911,6 +1942,16 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         this.#refreshSidebar().catch(() => {});
       });
       row.appendChild(merge);
+
+      const forget = document.createElementNS(XHTML_NS, "button");
+      forget.className = "zen-thread-done-btn zen-thread-forget-btn";
+      forget.textContent = "⌫";
+      forget.title = "Forget this thread and everything recorded in it";
+      forget.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#forgetThread(thread, liveTabs);
+      });
+      row.appendChild(forget);
 
       const done = document.createElementNS(XHTML_NS, "button");
       done.className = "zen-thread-done-btn";
