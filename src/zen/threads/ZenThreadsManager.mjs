@@ -13,6 +13,7 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
   PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  Downloads: "resource://gre/modules/Downloads.sys.mjs",
 });
 
 // browser.xhtml is a XUL document: bare createElement() would produce XUL
@@ -50,6 +51,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
   #sidebarRefreshTimer = null;
   #expandedSidebarThreads = new Set();
   #showArchived = false;
+  #shelfFilter = "";
+  #toastTimer = null;
+  #dwellStart = 0;
+  #downloadView = null;
+  #downloadList = null;
   #mergeSource = null; // thread id armed for merging
   #pendingGlance = new WeakMap(); // peeked tab -> its provenance, held back
   #returnCardTimer = null;
@@ -107,6 +113,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         })
         .catch(() => {});
       this.#lastSelected = gBrowser.selectedTab;
+      this.#dwellStart = Date.now();
       window.addEventListener("TabOpen", this);
       window.addEventListener("TabClose", this);
       window.addEventListener("TabSelect", this);
@@ -137,6 +144,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       };
       gBrowser.addTabsProgressListener(this.#progressListener);
       this.#initSidebar();
+      this.#watchDownloads();
       // Register the Intent Bar provider (process-wide, idempotent).
       ChromeUtils.importESModule(
         "chrome://browser/content/zen-components/ZenThreadsUrlbarProvider.sys.mjs"
@@ -219,6 +227,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           const prev = this.#lastSelected;
           const next = event.target;
           this.#lastSelected = next;
+          const now = Date.now();
+          if (prev && this.#dwellStart) {
+            const prevKey = this.#tabKeys.get(prev);
+            if (prevKey) {
+              ZenThreadsStorage.recordDwell(prevKey, now - this.#dwellStart);
+            }
+          }
+          this.#dwellStart = now;
           if (prev && prev !== next && !prev.closing) {
             const prevKey = this.#tabKeys.get(prev);
             const nextKey = this.#tabKeys.get(next);
@@ -318,6 +334,21 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
             }
           } catch (e) {
             // Window teardown; nothing useful to do.
+          }
+          if (this.#lastSelected && this.#dwellStart) {
+            const key = this.#tabKeys.get(this.#lastSelected);
+            if (key) {
+              ZenThreadsStorage.recordDwell(key, Date.now() - this.#dwellStart);
+            }
+          }
+          if (this.#downloadList && this.#downloadView) {
+            try {
+              this.#downloadList.removeView(this.#downloadView);
+            } catch (e) {
+              // List already gone.
+            }
+            this.#downloadList = null;
+            this.#downloadView = null;
           }
           this.#removeStartupObserver();
           for (const timer of [
@@ -616,7 +647,8 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       .sort((a, b) => b.score - a.score);
   }
 
-  #renderShelf(items) {
+  #renderShelf(itemsIn) {
+    let items = itemsIn;
     const section = document.createElementNS(XHTML_NS, "div");
     section.className = "zen-thread-section zen-shelf-section";
 
@@ -637,6 +669,36 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     const body = document.createElementNS(XHTML_NS, "div");
     body.className = "zen-thread-body";
+
+    if (items.length > 6 || this.#shelfFilter) {
+      const filter = document.createElementNS(XHTML_NS, "input");
+      filter.className = "zen-thread-note-input zen-shelf-filter";
+      filter.placeholder = "Filter shelf…";
+      filter.value = this.#shelfFilter;
+      filter.addEventListener("keydown", e => e.stopPropagation());
+      filter.addEventListener("click", e => e.stopPropagation());
+      filter.addEventListener("input", () => {
+        this.#shelfFilter = filter.value;
+        const caret = filter.selectionStart;
+        this.#render()
+          .then(() => {
+            const next = document.querySelector(".zen-shelf-filter");
+            if (next) {
+              next.focus();
+              next.setSelectionRange(caret, caret);
+            }
+          })
+          .catch(() => {});
+      });
+      body.appendChild(filter);
+    }
+
+    const needle = this.#shelfFilter.trim().toLowerCase();
+    if (needle) {
+      items = items.filter(item =>
+        `${item.title ?? ""} ${item.url}`.toLowerCase().includes(needle)
+      );
+    }
 
     const RECEDE_DAYS = 90;
     const current = items.filter(item => item.ageDays <= RECEDE_DAYS);
@@ -815,6 +877,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         const closable = [];
         this.#collectLiveTabs(thread.roots, liveTabs, closable, {
           includePinned: true,
+          skipReferences: true,
         });
         for (const t of closable) {
           try {
@@ -975,6 +1038,14 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
     row.appendChild(title);
 
+    if (node.isReference) {
+      const badge = document.createElementNS(XHTML_NS, "span");
+      badge.className = "zen-thread-reference-badge";
+      badge.textContent = "reference";
+      badge.title = "You return to this across different work — kept when a thread is done";
+      row.appendChild(badge);
+    }
+
     if (!node.isSearch && node.url) {
       const url = document.createElementNS(XHTML_NS, "span");
       url.className = "zen-thread-url";
@@ -1007,20 +1078,56 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     return container;
   }
 
+  /**
+   * Restore rather than re-fetch where possible: a session-restored tab comes
+   * back with its scroll position, form state and back-history intact, which
+   * is the difference between returning to your work and merely revisiting
+   * a URL.
+   */
+  #restoreClosedTab(node) {
+    try {
+      const closed = lazy.SessionStore.getClosedTabDataForWindow(window);
+      for (let i = 0; i < closed.length; i++) {
+        const entry = closed[i];
+        const key = entry?.state?.extData?.[TAB_KEY_PROP];
+        const matchesKey = key && key.replace(/^"|"$/g, "") === node.key;
+        const matchesUrl =
+          !key &&
+          entry?.state?.entries?.length &&
+          entry.state.entries[entry.state.entries.length - 1]?.url === node.url;
+        if (matchesKey || matchesUrl) {
+          const tab = lazy.SessionStore.undoCloseTab(window, i);
+          if (tab) {
+            return tab;
+          }
+        }
+      }
+    } catch (e) {
+      // Fall through to a plain load.
+    }
+    return null;
+  }
+
   #reopen(node) {
     try {
       // The TabOpen handler consumes this so the reopened page becomes a
       // child of the ghost node and stays inside its thread.
       this.#pendingReopenParent = node.key;
-      const tab = gBrowser.addTab(node.url, {
-        triggeringPrincipal:
-          Services.scriptSecurityManager.getSystemPrincipal(),
-      });
+      const restored = this.#restoreClosedTab(node);
+      const tab =
+        restored ||
+        gBrowser.addTab(node.url, {
+          triggeringPrincipal:
+            Services.scriptSecurityManager.getSystemPrincipal(),
+        });
+      this.#pendingReopenParent = null;
       gBrowser.selectedTab = tab;
       this.#render().catch(() => {});
+      return tab;
     } catch (e) {
       this.#pendingReopenParent = null;
       console.error("ZenThreads: reopen failed", e);
+      return null;
     }
   }
 
@@ -1029,6 +1136,56 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
    * Done path must include pinned ones or it would find nothing to close
    * once a thread has been grouped into a folder.
    */
+  async #exportThread(thread) {
+    const lines = [`# ${thread.title}`, ""];
+    const checkpoints = await ZenThreadsStorage.getCheckpoints();
+    const cp = checkpoints.get(thread.id);
+    if (cp?.note) {
+      lines.push(`> next: ${cp.note}`, "");
+    }
+    if (thread.outcomeTitle) {
+      lines.push(`**Chose:** ${thread.outcomeTitle}`, "");
+    }
+    const walk = (nodes, depth) => {
+      for (const node of nodes) {
+        if (/^https?:/.test(node.url)) {
+          const indent = "  ".repeat(depth);
+          const label = node.isSearch && node.query
+            ? `search: ${node.query}`
+            : node.title || node.url;
+          lines.push(`${indent}- [${label}](${node.url})`);
+        }
+        if (node.children.length) {
+          walk(node.children, depth + 1);
+        }
+      }
+    };
+    walk(thread.roots, 0);
+    lines.push("", `_Exported from Threads · ${new Date().toLocaleString()}_`);
+
+    const markdown = lines.join("\n");
+    try {
+      const transferable = Cc[
+        "@mozilla.org/widget/transferable;1"
+      ].createInstance(Ci.nsITransferable);
+      transferable.init(null);
+      const supportsString = Cc[
+        "@mozilla.org/supports-string;1"
+      ].createInstance(Ci.nsISupportsString);
+      supportsString.data = markdown;
+      transferable.addDataFlavor("text/plain");
+      transferable.setTransferData("text/plain", supportsString);
+      Services.clipboard.setData(
+        transferable,
+        null,
+        Ci.nsIClipboard.kGlobalClipboard
+      );
+      this.#toast("Thread copied as Markdown");
+    } catch (e) {
+      console.error("ZenThreads: export failed", e);
+    }
+  }
+
   #collectKeys(nodes, out = []) {
     for (const node of nodes) {
       out.push(node.key);
@@ -1057,19 +1214,28 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     setTimeout(() => this.#render().catch(() => {}), 150);
   }
 
-  #collectLiveTabs(nodes, liveTabs, out, { includePinned = false } = {}) {
+  #collectLiveTabs(
+    nodes,
+    liveTabs,
+    out,
+    { includePinned = false, skipReferences = false } = {}
+  ) {
     for (const node of nodes) {
       const entry = liveTabs.get(node.key);
       if (
         entry &&
         entry.win === window &&
         (includePinned || !entry.tab.pinned) &&
+        !(skipReferences && node.isReference) &&
         !out.includes(entry.tab)
       ) {
         out.push(entry.tab);
       }
       if (node.children.length) {
-        this.#collectLiveTabs(node.children, liveTabs, out, { includePinned });
+        this.#collectLiveTabs(node.children, liveTabs, out, {
+          includePinned,
+          skipReferences,
+        });
       }
     }
   }
@@ -1204,6 +1370,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         meta.textContent = `${block.pages} page${
           block.pages === 1 ? "" : "s"
         } · ${minutes} min`;
+        if (block.readPages) {
+          meta.textContent += ` · ${block.readPages} read`;
+        }
         main.appendChild(meta);
         row.appendChild(main);
 
@@ -1270,12 +1439,48 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!target) {
       return;
     }
+
+    // Bring the rest of the thread's recent pages back with it, capped so a
+    // long trail cannot flood the window.
+    const MAX_RESTORE = 8;
+    const closedNodes = [];
+    const gather = nodes => {
+      for (const node of nodes) {
+        if (
+          !liveTabs.has(node.key) &&
+          /^https?:/.test(node.url) &&
+          node !== target.node
+        ) {
+          closedNodes.push(node);
+        }
+        if (node.children.length) {
+          gather(node.children);
+        }
+      }
+    };
+    gather(thread.roots);
+    closedNodes.sort((a, b) => b.lastTs - a.lastTs);
+    for (const node of closedNodes.slice(0, MAX_RESTORE - 1)) {
+      const restored = this.#restoreClosedTab(node);
+      if (!restored) {
+        try {
+          gBrowser.addTab(node.url, {
+            triggeringPrincipal:
+              Services.scriptSecurityManager.getSystemPrincipal(),
+          });
+        } catch (e) {
+          // Skip anything that will not load.
+        }
+      }
+    }
+
     if (target.entry) {
       target.entry.win.focus();
       target.entry.win.gBrowser.selectedTab = target.entry.tab;
     } else {
       this.#reopen(target.node);
     }
+    this.#queueSidebarRefresh();
   }
 
   #dayLabel(dayStart) {
@@ -1317,7 +1522,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     let best = null;
     const walk = nodes => {
       for (const node of nodes) {
-        const candidates = node.children.filter(c => /^https?:/.test(c.url));
+        const candidates = node.children.filter(
+          c => /^https?:/.test(c.url) && !c.isReference
+        );
         if (
           candidates.length >= MIN_SIBLINGS &&
           (!best || candidates.length > best.candidates.length)
@@ -1427,6 +1634,16 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       });
       card.appendChild(open);
 
+      const keep = document.createElementNS(XHTML_NS, "button");
+      keep.className = "ztc-keep";
+      keep.textContent = "Keep this one";
+      keep.title = "Record this as the decision and shelve the rest";
+      keep.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#keepCandidate(thread, set, node, liveTabs);
+      });
+      card.appendChild(keep);
+
       grid.appendChild(card);
     }
 
@@ -1449,6 +1666,85 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         { duration: 0.24, bounce: 0 }
       );
     }
+  }
+
+  /**
+   * Comparing ends in a choice. Record it, keep the winner, and shelve the
+   * rest rather than destroying them — the trail stops offering to compare
+   * a decision that has already been made.
+   */
+  #keepCandidate(thread, set, chosen, liveTabs) {
+    try {
+      ZenThreadsStorage.setThreadOutcome(
+        thread.id,
+        chosen.url,
+        chosen.title || chosen.url
+      );
+      let shelved = 0;
+      for (const node of set.candidates) {
+        if (node.key === chosen.key) {
+          continue;
+        }
+        ZenThreadsStorage.shelvePage(node.url, node.title, node.key);
+        shelved++;
+        const entry = liveTabs.get(node.key);
+        if (entry && entry.win === window) {
+          try {
+            gBrowser.removeTab(entry.tab, { animate: true });
+          } catch (e) {
+            // Already gone.
+          }
+        }
+      }
+      this.#closeCompare();
+      const entry = liveTabs.get(chosen.key);
+      if (entry) {
+        entry.win.focus();
+        entry.win.gBrowser.selectedTab = entry.tab;
+      } else {
+        this.#reopen(chosen);
+      }
+      this.#toast(
+        `Kept “${chosen.title || chosen.url}” · ${shelved} shelved`
+      );
+      this.#queueSidebarRefresh();
+    } catch (e) {
+      console.error("ZenThreads: keep failed", e);
+    }
+  }
+
+  /**
+   * Small, self-dismissing confirmation. Zen's own toast API needs Fluent
+   * ids for dynamic values, so destructive actions get their own.
+   */
+  #toast(message, undo = null) {
+    let host = document.getElementById("zen-threads-toast");
+    if (!host) {
+      host = document.createElementNS(XHTML_NS, "div");
+      host.id = "zen-threads-toast";
+      document.getElementById("zen-threads-panel")?.parentNode?.appendChild(host);
+    }
+    host.replaceChildren();
+    const text = document.createElementNS(XHTML_NS, "span");
+    text.textContent = message;
+    host.appendChild(text);
+    if (undo) {
+      const button = document.createElementNS(XHTML_NS, "button");
+      button.className = "zen-threads-toast-undo";
+      button.textContent = "Undo";
+      button.addEventListener("click", () => {
+        undo();
+        host.hidden = true;
+      });
+      host.appendChild(button);
+    }
+    host.hidden = false;
+    if (this.#toastTimer) {
+      clearTimeout(this.#toastTimer);
+    }
+    this.#toastTimer = setTimeout(() => {
+      host.hidden = true;
+    }, undo ? 7000 : 3500);
   }
 
   #closeCompare() {
@@ -1623,6 +1919,49 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     } else {
       finish();
     }
+  }
+
+  /**
+   * Research ends in artefacts. A file saved while working on a goal belongs
+   * to that goal, not to a flat list in the Downloads panel.
+   */
+  #watchDownloads() {
+    lazy.Downloads.getList(lazy.Downloads.ALL)
+      .then(list => {
+        this.#downloadView = {
+          onDownloadAdded: download => {
+            try {
+              const tab = gBrowser.selectedTab;
+              const key = tab ? this.#tabKeys.get(tab) : null;
+              if (!key) {
+                return;
+              }
+              const url = download?.source?.url;
+              if (!url) {
+                return;
+              }
+              const name = download?.target?.path?.split("/").pop() || url;
+              const childKey = Services.uuid
+                .generateUUID()
+                .toString()
+                .slice(1, -1);
+              ZenThreadsStorage.recordEvent(
+                "download",
+                childKey,
+                key,
+                url,
+                name,
+                null
+              );
+            } catch (e) {
+              console.error("ZenThreads: download capture failed", e);
+            }
+          },
+        };
+        list.addView(this.#downloadView);
+        this.#downloadList = list;
+      })
+      .catch(() => {});
   }
 
   #removeStartupObserver() {
@@ -1943,6 +2282,18 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       });
       row.appendChild(merge);
 
+      const share = document.createElementNS(XHTML_NS, "button");
+      share.className = "zen-thread-done-btn";
+      share.textContent = "↗";
+      share.title = "Copy this thread as Markdown";
+      share.addEventListener("click", e => {
+        e.stopPropagation();
+        this.#exportThread(thread).catch(err =>
+          console.error("ZenThreads: export failed", err)
+        );
+      });
+      row.appendChild(share);
+
       const forget = document.createElementNS(XHTML_NS, "button");
       forget.className = "zen-thread-done-btn zen-thread-forget-btn";
       forget.textContent = "⌫";
@@ -1963,6 +2314,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         const out = [];
         this.#collectLiveTabs(thread.roots, liveTabs, out, {
           includePinned: true,
+          skipReferences: true,
         });
         for (const t of out) {
           try {
@@ -1983,6 +2335,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         this.#refreshSidebar().catch(() => {});
       });
       el.appendChild(row);
+
+      if (thread.outcomeTitle) {
+        const chose = document.createElementNS(XHTML_NS, "div");
+        chose.className = "zen-ts-checkpoint zen-ts-outcome";
+        chose.textContent = `✓ chose: ${thread.outcomeTitle}`;
+        el.appendChild(chose);
+      }
 
       const cp = checkpoints.get(thread.id);
       if (!isActive && cp && (cp.note || cp.lastTitle)) {

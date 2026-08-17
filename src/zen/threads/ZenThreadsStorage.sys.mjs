@@ -85,6 +85,7 @@ export const ZenThreadsStorage = new (class {
   #maxEventId = 0;
   #foldedSeq = -1;
   #graphCache = null;
+  #hasFts = false;
 
   constructor() {
     this.#dbReady = this.#open();
@@ -113,6 +114,41 @@ export const ZenThreadsStorage = new (class {
       await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_tab ON events(tab)"
       );
+      // Retrieval: search what is inside a thread, not just its name.
+      try {
+        await db.execute(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS events_fts
+          USING fts5(title, url, search_query, content='events',
+                     content_rowid='id', tokenize='unicode61')
+        `);
+        await db.execute(`
+          CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events
+          BEGIN
+            INSERT INTO events_fts(rowid, title, url, search_query)
+            VALUES (new.id, new.title, new.url, new.search_query);
+          END
+        `);
+        await db.execute(`
+          CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events
+          BEGIN
+            INSERT INTO events_fts(events_fts, rowid, title, url, search_query)
+            VALUES ('delete', old.id, old.title, old.url, old.search_query);
+          END
+        `);
+        // Backfill anything recorded before the index existed.
+        const [row] = await db.execute("SELECT count(*) AS n FROM events_fts");
+        if (!row.getResultByName("n")) {
+          await db.execute(`
+            INSERT INTO events_fts(rowid, title, url, search_query)
+            SELECT id, title, url, search_query FROM events
+          `);
+        }
+        this.#hasFts = true;
+      } catch (e) {
+        // Not every build ships FTS5; fall back to scanning the log, which
+        // retention keeps small enough for this to stay cheap.
+        this.#hasFts = false;
+      }
       await db.execute(`
         CREATE TABLE IF NOT EXISTS thread_folders (
           thread_id TEXT PRIMARY KEY,
@@ -153,7 +189,17 @@ export const ZenThreadsStorage = new (class {
           PRIMARY KEY (a, b)
         )
       `);
-      for (const col of ["status TEXT", "status_ts INTEGER"]) {
+      try {
+        await db.execute("ALTER TABLE events ADD COLUMN dwell_ms INTEGER");
+      } catch (e) {
+        // Column already exists.
+      }
+      for (const col of [
+        "status TEXT",
+        "status_ts INTEGER",
+        "outcome_url TEXT",
+        "outcome_title TEXT",
+      ]) {
         try {
           await db.execute(`ALTER TABLE thread_meta ADD COLUMN ${col}`);
         } catch (e) {
@@ -328,6 +374,30 @@ export const ZenThreadsStorage = new (class {
         this.#resetDerived();
       } catch (e) {
         console.error("ZenThreadsStorage: retention sweep failed", e);
+      }
+    });
+  }
+
+  /** Time actually spent on a page, accumulated per tab. */
+  recordDwell(tabKey, ms) {
+    if (!tabKey || !(ms > 1000)) {
+      return; // a glance past a page is not attention
+    }
+    this.#eventSeq++;
+    const ts = Date.now();
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.executeCached(
+          `INSERT INTO events (ts, kind, tab, dwell_ms)
+           VALUES (:ts, 'dwell', :tab, :ms)`,
+          { ts, tab: tabKey, ms: Math.round(ms) }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: recordDwell failed", e);
       }
     });
   }
@@ -614,6 +684,27 @@ export const ZenThreadsStorage = new (class {
     return links;
   }
 
+  setThreadOutcome(threadId, url, title) {
+    this.#metaRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT INTO thread_meta (thread_id, outcome_url, outcome_title)
+           VALUES (:threadId, :url, :title)
+           ON CONFLICT(thread_id) DO UPDATE SET
+             outcome_url = :url, outcome_title = :title`,
+          { threadId, url, title: title ?? null }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setThreadOutcome failed", e);
+      }
+    });
+  }
+
   setThreadStatus(threadId, status) {
     this.#metaRev++;
     const ts = Date.now();
@@ -646,13 +737,16 @@ export const ZenThreadsStorage = new (class {
     }
     try {
       const rows = await this.#db.executeCached(
-        "SELECT thread_id, title, status, status_ts FROM thread_meta"
+        `SELECT thread_id, title, status, status_ts, outcome_url, outcome_title
+         FROM thread_meta`
       );
       for (const row of rows) {
         map.set(row.getResultByName("thread_id"), {
           title: row.getResultByName("title"),
           status: row.getResultByName("status"),
           statusTs: row.getResultByName("status_ts"),
+          outcomeUrl: row.getResultByName("outcome_url"),
+          outcomeTitle: row.getResultByName("outcome_title"),
         });
       }
     } catch (e) {
@@ -685,7 +779,12 @@ export const ZenThreadsStorage = new (class {
     }
     await this.#dbReady;
     if (!this.#db) {
-      return { threads: [], loose: [], nodeThread: new Map() };
+      return {
+        threads: [],
+        loose: [],
+        nodeThread: new Map(),
+        references: new Set(),
+      };
     }
     await this.#advanceFold();
 
@@ -712,6 +811,8 @@ export const ZenThreadsStorage = new (class {
         isSearch: renamed ? false : shell.isSearch,
         lastTs: shell.lastTs,
         roots: shell.roots,
+        outcomeTitle: m?.outcomeTitle ?? null,
+        outcomeUrl: m?.outcomeUrl ?? null,
         done,
         tier: done
           ? "archived"
@@ -727,6 +828,7 @@ export const ZenThreadsStorage = new (class {
       threads: threads.slice(0, MAX_THREADS),
       loose: graph.loose,
       nodeThread: graph.nodeThread,
+      references: graph.references ?? new Set(),
     };
     this.#snapshotCache = { key: cacheKey, value };
     return value;
@@ -782,6 +884,7 @@ export const ZenThreadsStorage = new (class {
           closed: true,
           firstTs: 0,
           lastTs: 0,
+          dwellMs: 0,
         };
         nodes.set(key, node);
       }
@@ -811,6 +914,10 @@ export const ZenThreadsStorage = new (class {
       }
       const url = row.getResultByName("url");
       const title = row.getResultByName("title");
+      if (kind === "dwell") {
+        node.dwellMs += row.getResultByName("dwell_ms") ?? 0;
+        continue;
+      }
       switch (kind) {
         case "close":
           node.closed = true;
@@ -851,6 +958,16 @@ export const ZenThreadsStorage = new (class {
           }
           break;
         }
+        case "download":
+          node.isDownload = true;
+          node.closed = true;
+          if (url) {
+            node.url = url;
+          }
+          if (title) {
+            node.title = title;
+          }
+          break;
         default:
           // open / seed / restore
           node.closed = false;
@@ -1024,7 +1141,135 @@ export const ZenThreadsStorage = new (class {
       indexNodes(shell.roots, shell.id);
     }
 
-    return { shells, loose, nodeThread };
+    // A page that turns up under more than one goal is a Reference: durable
+    // knowledge rather than part of any single decision.
+    const minThreads = Math.max(
+      2,
+      Services.prefs.getIntPref("zen.threads.reference-thread-count", 2)
+    );
+    const urlThreads = new Map();
+    for (const node of nodes.values()) {
+      if (!/^https?:/.test(node.url)) {
+        continue;
+      }
+      const threadId = nodeThread.get(node.key);
+      if (!threadId) {
+        continue;
+      }
+      let set = urlThreads.get(node.url);
+      if (!set) {
+        set = new Set();
+        urlThreads.set(node.url, set);
+      }
+      set.add(threadId);
+    }
+    const references = new Set();
+    for (const [url, threadIds] of urlThreads) {
+      if (threadIds.size >= minThreads) {
+        references.add(url);
+      }
+    }
+    for (const node of nodes.values()) {
+      node.isReference = references.has(node.url);
+    }
+
+    return { shells, loose, nodeThread, references };
+  }
+
+  /**
+   * Search inside threads. Each hit carries the thread it belongs to and
+   * when it happened, so it can be offered with the context no ordinary
+   * history can produce: "from 'browser redesign', Tuesday 10:32".
+   */
+  async searchMemory(query, limit = 8) {
+    const trimmed = (query ?? "").trim();
+    if (trimmed.length < 2) {
+      return [];
+    }
+    await this.#dbReady;
+    if (!this.#db) {
+      return [];
+    }
+    const { nodeThread, threads } = await this.getSnapshot();
+    const threadById = new Map(threads.map(t => [t.id, t]));
+
+    // Prefix-match each term; quote to keep FTS syntax out of user input.
+    const match = trimmed
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(term => `"${term.replace(/"/g, '""')}"*`)
+      .join(" AND ");
+
+    const terms = trimmed.split(/\s+/).filter(Boolean).slice(0, 6);
+    let rows;
+    try {
+      if (this.#hasFts) {
+        rows = await this.#db.execute(
+          `SELECT e.tab, e.url, e.title, e.ts
+           FROM events_fts f
+           JOIN events e ON e.id = f.rowid
+           WHERE events_fts MATCH :match AND e.url LIKE 'http%'
+           ORDER BY e.ts DESC
+           LIMIT :limit`,
+          { match, limit: limit * 6 }
+        );
+      } else {
+        const params = { limit: limit * 6 };
+        const clauses = terms.map((term, i) => {
+          params[`t${i}`] = `%${term.replace(/[%_]/g, "")}%`;
+          return `(e.title LIKE :t${i} OR e.url LIKE :t${i} OR e.search_query LIKE :t${i})`;
+        });
+        rows = await this.#db.execute(
+          `SELECT e.tab, e.url, e.title, e.ts
+           FROM events e
+           WHERE e.url LIKE 'http%' AND e.kind = 'nav'
+             ${clauses.length ? "AND " + clauses.join(" AND ") : ""}
+           ORDER BY e.ts DESC
+           LIMIT :limit`,
+          params
+        );
+      }
+    } catch (e) {
+      return []; // malformed query text; no results rather than an error
+    }
+
+    const seen = new Set();
+    const hits = [];
+    for (const row of rows) {
+      const url = row.getResultByName("url");
+      if (seen.has(url)) {
+        continue;
+      }
+      seen.add(url);
+      const tab = row.getResultByName("tab");
+      const threadId = nodeThread.get(tab);
+      const thread = threadId ? threadById.get(threadId) : null;
+      hits.push({
+        url,
+        title: row.getResultByName("title"),
+        ts: row.getResultByName("ts"),
+        threadId,
+        threadTitle: thread?.title ?? null,
+      });
+      if (hits.length >= limit) {
+        break;
+      }
+    }
+    return hits;
+  }
+
+  /** Shelf search, so a long shelf stays usable. */
+  async searchShelf(query, limit = 5) {
+    const trimmed = (query ?? "").trim().toLowerCase();
+    const items = await this.getShelf(200);
+    if (!trimmed) {
+      return items.slice(0, limit);
+    }
+    return items
+      .filter(item =>
+        `${item.title ?? ""} ${item.url}`.toLowerCase().includes(trimmed)
+      )
+      .slice(0, limit);
   }
 
   /**
@@ -1079,9 +1324,16 @@ export const ZenThreadsStorage = new (class {
         current.end = ts;
         current.urls.add(url);
       } else {
-        current = { threadId, start: ts, end: ts, urls: new Set([url]) };
+        current = {
+          threadId,
+          start: ts,
+          end: ts,
+          urls: new Set([url]),
+          tabs: new Set(),
+        };
         blocks.push(current);
       }
+      current.tabs.add(tab);
     }
 
     const byDay = new Map();
@@ -1093,7 +1345,15 @@ export const ZenThreadsStorage = new (class {
         byDay.set(dayStart, []);
       }
       const meta = titleById.get(block.threadId);
+      const READ_MS = 30000;
+      let readPages = 0;
+      for (const tab of block.tabs ?? []) {
+        if ((this.#nodes.get(tab)?.dwellMs ?? 0) >= READ_MS) {
+          readPages++;
+        }
+      }
       byDay.get(dayStart).push({
+        readPages,
         threadId: block.threadId,
         title: meta?.title ?? "Untitled thread",
         isSearch: !!meta?.isSearch,
