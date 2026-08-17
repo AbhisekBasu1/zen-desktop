@@ -12,6 +12,7 @@ const { ZenThreadsStorage } = ChromeUtils.importESModule(
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
 });
 
 // browser.xhtml is a XUL document: bare createElement() would produce XUL
@@ -61,6 +62,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
   init() {
     try {
+      // Private browsing must leave no trace: the whole feature writes to a
+      // permanent on-disk log, so it does not run in private windows at all.
+      if (lazy.PrivateBrowsingUtils.isWindowPrivate(window)) {
+        return;
+      }
       window.addEventListener("unload", this, { once: true });
       // gBrowser does not exist yet at DOMContentLoaded — wait for the
       // window's delayed startup before touching tabs.
