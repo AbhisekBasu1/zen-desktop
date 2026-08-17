@@ -253,3 +253,121 @@ add_task(async function test_checkpoint_write_preserves_typed_note() {
   );
   is(cp.lastTitle, "Last Page", "Automatic checkpoint updates the position");
 });
+
+add_task(async function test_same_tab_search_keeps_its_origin() {
+  // The common case: search, then click a result in the SAME tab. The trail
+  // must still be rooted in — and named after — the search.
+  const key = freshKey("same-tab");
+
+  ZenThreadsStorage.recordEvent("open", key, null, null, "New Tab", null);
+  ZenThreadsStorage.recordEvent(
+    "nav",
+    key,
+    null,
+    "https://www.google.com/search?q=same+tab+origin+test",
+    "same tab origin test - Google Search",
+    "same tab origin test"
+  );
+  // Same tab navigates onward to a result.
+  ZenThreadsStorage.recordEvent(
+    "nav",
+    key,
+    null,
+    "https://example.com/the-result",
+    "The Result",
+    null
+  );
+
+  const found = await threadsFor([key]);
+  is(found.length, 1, "A same-tab search still forms a thread on its own");
+  is(
+    found[0].title,
+    "same tab origin test",
+    "Navigating in place does not erase the search that started the trail"
+  );
+  ok(found[0].isSearch, "Thread is still recognised as search-rooted");
+});
+
+add_task(async function test_done_survives_closing_its_tabs() {
+  const searchKey = freshKey("done-search");
+  const resultKey = freshKey("done-result");
+
+  ZenThreadsStorage.recordEvent("open", searchKey, null, null, "S", null);
+  ZenThreadsStorage.recordEvent(
+    "nav",
+    searchKey,
+    null,
+    "https://duckduckgo.com/?q=done+lifecycle+test",
+    "done lifecycle test",
+    "done lifecycle test"
+  );
+  ZenThreadsStorage.recordEvent("open", resultKey, searchKey, null, "R", null);
+  ZenThreadsStorage.recordEvent(
+    "nav",
+    resultKey,
+    null,
+    "https://example.com/done-lifecycle",
+    "Done Lifecycle",
+    null
+  );
+
+  let found = await threadsFor([searchKey]);
+  is(found.length, 1, "Thread exists before being marked done");
+  const threadId = found[0].id;
+
+  // Marking done happens first, then the tabs close — the close events must
+  // not make the thread look active again.
+  ZenThreadsStorage.setThreadStatus(threadId, "done");
+  ZenThreadsStorage.recordEvent(
+    "close",
+    resultKey,
+    null,
+    "https://example.com/done-lifecycle",
+    "Done Lifecycle",
+    null
+  );
+  ZenThreadsStorage.recordEvent("close", searchKey, null, null, "S", null);
+
+  found = await threadsFor([searchKey]);
+  is(found.length, 1, "Thread is still derivable after being archived");
+  ok(found[0].done, "Closing its tabs does not resurrect a done thread");
+  is(found[0].tier, "archived", "A done thread is archived");
+});
+
+add_task(async function test_merge_can_be_undone() {
+  const a = freshKey("unmerge-a");
+  const b = freshKey("unmerge-b");
+
+  for (const [key, query] of [
+    [a, "unmerge alpha test"],
+    [b, "unmerge beta test"],
+  ]) {
+    ZenThreadsStorage.recordEvent("open", key, null, null, "S", null);
+    ZenThreadsStorage.recordEvent(
+      "nav",
+      key,
+      null,
+      `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
+      query,
+      query
+    );
+    const child = freshKey("unmerge-child");
+    ZenThreadsStorage.recordEvent("open", child, key, null, "R", null);
+    ZenThreadsStorage.recordEvent(
+      "nav",
+      child,
+      null,
+      `https://example.com/${encodeURIComponent(query)}`,
+      query,
+      null
+    );
+  }
+
+  is((await threadsFor([a, b])).length, 2, "Two threads to begin with");
+
+  ZenThreadsStorage.linkThreads(a, b);
+  is((await threadsFor([a, b])).length, 1, "Merging fuses them");
+
+  ZenThreadsStorage.unlinkThread(a);
+  is((await threadsFor([a, b])).length, 2, "Unmerging separates them again");
+});

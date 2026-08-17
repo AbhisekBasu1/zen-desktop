@@ -459,6 +459,24 @@ export const ZenThreadsStorage = new (class {
     });
   }
 
+  unlinkThread(threadId) {
+    this.#linkRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          "DELETE FROM thread_links WHERE a = :id OR b = :id",
+          { id: threadId }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: unlinkThread failed", e);
+      }
+    });
+  }
+
   async #getThreadLinks() {
     const links = [];
     if (!this.#db) {
@@ -661,7 +679,11 @@ export const ZenThreadsStorage = new (class {
       if (!node.firstTs) {
         node.firstTs = ts;
       }
-      node.lastTs = ts;
+      if (kind !== "close") {
+        node.lastTs = ts;
+      } else if (!node.lastTs) {
+        node.lastTs = ts;
+      }
       const parent = row.getResultByName("parent");
       if (parent && !node.parent && parent !== key) {
         node.parent = parent;
@@ -700,6 +722,12 @@ export const ZenThreadsStorage = new (class {
           const query = row.getResultByName("search_query");
           node.isSearch = !!query;
           node.query = query;
+          // Write-once: clicking a result in the SAME tab must not erase the
+          // search that started the trail, or the thread loses both its name
+          // and its reason to exist.
+          if (query && !node.originQuery) {
+            node.originQuery = query;
+          }
           break;
         }
         default:
@@ -836,7 +864,7 @@ export const ZenThreadsStorage = new (class {
       }
       seenComps.add(comp);
       const span = comp.lastTs - comp.firstTs;
-      const hasSearchRoot = comp.root.isSearch;
+      const hasSearchRoot = !!comp.root.originQuery || comp.root.isSearch;
       // Empty new-tab chains must never become threads.
       const hasContent = comp.members.some(n => /^https?:/.test(n.url));
       const qualifies =
@@ -851,7 +879,7 @@ export const ZenThreadsStorage = new (class {
       shells.push({
         id: comp.root.key,
         title: this.#titleFor(comp.root),
-        isSearch: comp.root.isSearch,
+        isSearch: !!comp.root.originQuery || comp.root.isSearch,
         lastTs: comp.lastTs,
         roots: [comp.root],
       });
@@ -963,6 +991,9 @@ export const ZenThreadsStorage = new (class {
   }
 
   #titleFor(root) {
+    if (root.originQuery) {
+      return root.originQuery;
+    }
     if (root.isSearch && root.query) {
       return root.query;
     }

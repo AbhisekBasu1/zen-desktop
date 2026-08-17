@@ -249,10 +249,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           break;
         }
         case "keydown": {
+          // Shelve on accel+Shift+S. Plain accel+S is deliberately NOT used:
+          // it is Save in every web app (intercepting it closed the tab and
+          // lost work, because focus in web content reads as <browser> here,
+          // not input/textarea) and Zen already binds it to compact mode.
           if (
-            event.metaKey &&
-            !event.ctrlKey &&
-            !event.shiftKey &&
+            (event.metaKey || event.ctrlKey) &&
+            event.shiftKey &&
             !event.altKey &&
             event.key.toLowerCase() === "s"
           ) {
@@ -261,7 +264,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
               ae &&
               (ae.localName === "input" || ae.localName === "textarea")
             ) {
-              break; // typing in chrome UI — leave Cmd+S alone
+              break; // typing in chrome UI
             }
             if (this.#shelveCurrent()) {
               event.preventDefault();
@@ -777,7 +780,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         : "Merge: arm this thread, then click ⇆ on the destination";
     merge.addEventListener("click", e => {
       e.stopPropagation();
-      if (!this.#mergeSource) {
+      if (e.altKey) {
+        ZenThreadsStorage.unlinkThread(thread.id);
+        this.#mergeSource = null;
+        this.#queueSidebarRefresh();
+      } else if (!this.#mergeSource) {
         this.#mergeSource = thread.id;
       } else if (this.#mergeSource === thread.id) {
         this.#mergeSource = null;
@@ -1809,7 +1816,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const hint = document.createElementNS(XHTML_NS, "div");
       hint.className = "zen-ts-hint";
       hint.textContent =
-        "Research trails gather here on their own. ⌘S shelves a page for later.";
+        "Research trails gather here on their own. ⇧⌘S shelves a page.";
       el.appendChild(hint);
       return;
     }
@@ -1887,10 +1894,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       merge.title =
         this.#mergeSource && this.#mergeSource !== thread.id
           ? "Merge the armed thread into this one"
-          : "Merge: arm this thread, then click ⇆ on the destination";
+          : "Merge: arm this thread, then click ⇆ on the destination (alt-click to unmerge)";
       merge.addEventListener("click", e => {
         e.stopPropagation();
-        if (!this.#mergeSource) {
+        if (e.altKey) {
+          ZenThreadsStorage.unlinkThread(thread.id);
+          this.#mergeSource = null;
+        } else if (!this.#mergeSource) {
           this.#mergeSource = thread.id;
         } else if (this.#mergeSource === thread.id) {
           this.#mergeSource = null;
