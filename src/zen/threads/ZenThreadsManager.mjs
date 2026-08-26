@@ -23,15 +23,25 @@ const XHTML_NS = "http://www.w3.org/1999/xhtml";
 // Strings come from browser/zen-threads.ftl. The English text stays inline as
 // a fallback so a missing or not-yet-translated id degrades to readable text
 // rather than an empty label.
-let gStrings = null;
-function ftl(id, fallback, args = null) {
+// Resolved once, asynchronously, into a plain map. Never do synchronous
+// localization here: these helpers run for every row of every render, and a
+// sync bundle lookup on that path blocks the main thread.
+const gStrings = new Map();
+function ftl(id, fallback) {
+  return gStrings.get(id) ?? fallback;
+}
+
+async function preloadStrings(ids) {
   try {
-    if (!gStrings) {
-      gStrings = new Localization(["browser/zen-threads.ftl"], true);
-    }
-    return gStrings.formatValueSync(id, args) || fallback;
+    const l10n = new Localization(["browser/zen-threads.ftl"]);
+    const values = await l10n.formatValues(ids.map(id => ({ id })));
+    ids.forEach((id, i) => {
+      if (values[i]) {
+        gStrings.set(id, values[i]);
+      }
+    });
   } catch (e) {
-    return fallback;
+    // Fallbacks already cover every call site.
   }
 }
 
@@ -160,6 +170,56 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       gBrowser.addTabsProgressListener(this.#progressListener);
       this.#initSidebar();
       this.#watchDownloads();
+      preloadStrings([
+        "zen-threads-action-done",
+        "zen-threads-action-export",
+        "zen-threads-action-forget",
+        "zen-threads-action-grouped",
+        "zen-threads-action-restore",
+        "zen-threads-compare-closed",
+        "zen-threads-compare-goto",
+        "zen-threads-compare-keep",
+        "zen-threads-compare-keep-tooltip",
+        "zen-threads-compare-open",
+        "zen-threads-compare-reopen",
+        "zen-threads-journal-button",
+        "zen-threads-journal-resume",
+        "zen-threads-journal-title",
+        "zen-threads-journal-today",
+        "zen-threads-journal-tooltip",
+        "zen-threads-journal-yesterday",
+        "zen-threads-loose-tabs",
+        "zen-threads-note-placeholder",
+        "zen-threads-note-placeholder-own",
+        "zen-threads-panel-empty",
+        "zen-threads-reference-badge",
+        "zen-threads-rename-tooltip",
+        "zen-threads-shelf-affinity",
+        "zen-threads-shelf-filter",
+        "zen-threads-shelf-label",
+        "zen-threads-shelf-remove",
+        "zen-threads-sidebar-label",
+        "zen-threads-toast-undo",
+      ]).then(() => this.#queueSidebarRefresh());
+
+      // Commands, so the feature is reachable from the palette and can be
+      // bound to keys through Zen's own settings rather than only ours.
+      for (const [id, handler] of [
+        ["cmd_zenThreadsTogglePanel", () => this.togglePanel()],
+        ["cmd_zenThreadsShelvePage", () => this.#shelveCurrent()],
+        [
+          "cmd_zenThreadsOpenJournal",
+          () =>
+            this.#openJournal().catch(e =>
+              console.error("ZenThreads: journal failed", e)
+            ),
+        ],
+      ]) {
+        const command = document.getElementById(id);
+        if (command) {
+          command.addEventListener("command", handler);
+        }
+      }
       // Register the Intent Bar provider (process-wide, idempotent).
       ChromeUtils.importESModule(
         "chrome://browser/content/zen-components/ZenThreadsUrlbarProvider.sys.mjs"
@@ -752,7 +812,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (items.length > 6 || this.#shelfFilter) {
       const filter = document.createElementNS(XHTML_NS, "input");
       filter.className = "zen-thread-note-input zen-shelf-filter";
-      filter.placeholder = "Filter shelf…";
+      filter.placeholder = ftl("zen-threads-shelf-filter", "Filter shelf…");
       filter.value = this.#shelfFilter;
       filter.addEventListener("keydown", e => e.stopPropagation());
       filter.addEventListener("click", e => e.stopPropagation());
@@ -812,7 +872,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
       const dismiss = document.createElementNS(XHTML_NS, "button");
       dismiss.className = "zen-shelf-x";
-      dismiss.setAttribute("aria-label", "Remove from shelf");
+      dismiss.setAttribute(
+        "aria-label",
+        ftl("zen-threads-shelf-remove", "Remove from shelf")
+      );
       dismiss.textContent = "×";
       dismiss.title = "Remove from shelf";
       dismiss.addEventListener("click", e => {
@@ -881,7 +944,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     title.textContent = thread.isSearch
       ? `\u{1F50D} ${thread.title}`
       : thread.title;
-    title.title = "Double-click to rename";
+    title.title = ftl("zen-threads-rename-tooltip", "Double-click to rename");
     title.addEventListener("dblclick", e => {
       e.stopPropagation();
       this.#startRename(thread, header);
@@ -978,7 +1041,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const badge = document.createElementNS(XHTML_NS, "span");
       badge.className = "zen-thread-folder-badge";
       badge.textContent = "\u{1F4C1}";
-      badge.title = "Grouped in sidebar";
+      badge.title = ftl("zen-threads-action-grouped", "Grouped in sidebar");
       header.appendChild(badge);
     } else if (
       liveThreadTabs.length >= 2 &&
@@ -1017,9 +1080,27 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       body.appendChild(this.#renderNode(root, liveTabs));
     }
 
+    const threadNote = document.createElementNS(XHTML_NS, "textarea");
+    threadNote.className = "zen-thread-notepad";
+    threadNote.rows = 2;
+    threadNote.placeholder = ftl(
+      "zen-threads-note-placeholder-own",
+      "Notes on this thread…"
+    );
+    threadNote.value = thread.note ?? "";
+    threadNote.addEventListener("keydown", e => e.stopPropagation());
+    threadNote.addEventListener("click", e => e.stopPropagation());
+    threadNote.addEventListener("change", () => {
+      ZenThreadsStorage.setThreadNote(thread.id, threadNote.value.trim());
+    });
+    threadNote.addEventListener("blur", () => {
+      ZenThreadsStorage.setThreadNote(thread.id, threadNote.value.trim());
+    });
+    body.appendChild(threadNote);
+
     const noteInput = document.createElementNS(XHTML_NS, "input");
     noteInput.className = "zen-thread-note-input";
-    noteInput.placeholder = "next: …";
+    noteInput.placeholder = ftl("zen-threads-note-placeholder", "next: …");
     noteInput.addEventListener("keydown", e => {
       e.stopPropagation();
       if (e.key === "Enter") {
@@ -1228,6 +1309,9 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     const cp = checkpoints.get(thread.id);
     if (cp?.note) {
       lines.push(`> next: ${cp.note}`, "");
+    }
+    if (thread.note) {
+      lines.push(thread.note, "");
     }
     if (thread.outcomeTitle) {
       lines.push(`**Chose:** ${thread.outcomeTitle}`, "");
@@ -2508,7 +2592,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const share = document.createElementNS(XHTML_NS, "button");
       share.className = "zen-thread-done-btn";
       share.textContent = "↗";
-      share.title = "Copy this thread as Markdown";
+      share.title = ftl("zen-threads-action-export", "Copy this thread as Markdown");
       share.addEventListener("click", e => {
         e.stopPropagation();
         this.#exportThread(thread).catch(err =>
@@ -2520,7 +2604,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       const forget = document.createElementNS(XHTML_NS, "button");
       forget.className = "zen-thread-done-btn zen-thread-forget-btn";
       forget.textContent = "⌫";
-      forget.title = "Forget this thread and everything recorded in it";
+      forget.title = ftl(
+        "zen-threads-action-forget",
+        "Forget this thread and everything recorded in it"
+      );
       forget.addEventListener("click", e => {
         e.stopPropagation();
         this.#forgetThread(thread, liveTabs);

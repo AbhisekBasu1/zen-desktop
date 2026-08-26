@@ -206,6 +206,7 @@ export const ZenThreadsStorage = new (class {
         "status_ts INTEGER",
         "outcome_url TEXT",
         "outcome_title TEXT",
+        "note TEXT",
       ]) {
         try {
           await db.execute(`ALTER TABLE thread_meta ADD COLUMN ${col}`);
@@ -771,6 +772,26 @@ export const ZenThreadsStorage = new (class {
     return links;
   }
 
+  /** Free-form notes: a thread holds your thinking, not just its pages. */
+  setThreadNote(threadId, note) {
+    this.#metaRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT INTO thread_meta (thread_id, note) VALUES (:threadId, :note)
+           ON CONFLICT(thread_id) DO UPDATE SET note = :note`,
+          { threadId, note: note || null }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: setThreadNote failed", e);
+      }
+    });
+  }
+
   setThreadOutcome(threadId, url, title) {
     this.#metaRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
@@ -824,7 +845,8 @@ export const ZenThreadsStorage = new (class {
     }
     try {
       const rows = await this.#db.executeCached(
-        `SELECT thread_id, title, status, status_ts, outcome_url, outcome_title
+        `SELECT thread_id, title, status, status_ts, outcome_url,
+                outcome_title, note
          FROM thread_meta`
       );
       for (const row of rows) {
@@ -834,6 +856,7 @@ export const ZenThreadsStorage = new (class {
           statusTs: row.getResultByName("status_ts"),
           outcomeUrl: row.getResultByName("outcome_url"),
           outcomeTitle: row.getResultByName("outcome_title"),
+          note: row.getResultByName("note"),
         });
       }
     } catch (e) {
@@ -903,6 +926,7 @@ export const ZenThreadsStorage = new (class {
         roots: shell.roots,
         outcomeTitle: m?.outcomeTitle ?? null,
         outcomeUrl: m?.outcomeUrl ?? null,
+        note: m?.note ?? null,
         done,
         tier: done
           ? "archived"

@@ -23,6 +23,21 @@ function isNotEmptyTab(window) {
 
 const globalActionsTemplate = [
   {
+    l10nId: "zen-action-threads-panel",
+    command: "cmd_zenThreadsTogglePanel",
+    icon: "chrome://browser/skin/zen-icons/sidebar.svg",
+  },
+  {
+    l10nId: "zen-action-threads-shelve",
+    command: "cmd_zenThreadsShelvePage",
+    icon: "chrome://browser/skin/zen-icons/save.svg",
+  },
+  {
+    l10nId: "zen-action-threads-journal",
+    command: "cmd_zenThreadsOpenJournal",
+    icon: "chrome://browser/skin/zen-icons/history.svg",
+  },
+  {
     l10nId: "zen-action-toggle-compact-mode",
     command: "cmd_zenCompactModeToggle",
     icon: "chrome://browser/skin/zen-icons/sidebar.svg",

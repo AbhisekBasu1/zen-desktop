@@ -913,3 +913,30 @@
 .zen-threads-toast-undo:hover {
   background: var(--zen-toolbar-element-bg-hover, color-mix(in srgb, currentColor 12%, transparent));
 }
+
+.zen-thread-notepad {
+  -moz-appearance: none;
+  appearance: none;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 4px 0 2px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.85em;
+  line-height: 1.4;
+  color: inherit;
+  resize: vertical;
+  background: var(--zen-colors-input-bg, color-mix(in srgb, currentColor 6%, transparent));
+  border: 1px solid var(--zen-colors-border, color-mix(in srgb, currentColor 14%, transparent));
+  border-radius: 7px;
+  outline: none;
+}
+
+.zen-thread-notepad::placeholder {
+  color: inherit;
+  opacity: 0.4;
+}
+
+.zen-thread-notepad:focus {
+  border-color: color-mix(in srgb, var(--zen-primary-color, currentColor) 45%, transparent);
+}

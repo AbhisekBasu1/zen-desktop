@@ -36,6 +36,9 @@ zen-threads-show-archived =
     Show archived · { $count }
 zen-threads-hide-archived = Hide archived
 zen-threads-note-placeholder = next: …
+zen-threads-note-placeholder-own = Notes on this thread…
+zen-threads-shelf-filter = Filter shelf…
+zen-threads-action-export = Copy this thread as Markdown
 zen-threads-shelf-remove = Remove from shelf
 zen-threads-shelf-receded =
     Receded · { $count }

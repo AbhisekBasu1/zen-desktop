@@ -34,3 +34,7 @@ zen-action-switch-to-dark-mode = Switch to Dark Mode
 zen-action-print = Print
 zen-action-focus-on = Focus on
 zen-action-extension = Extension
+
+zen-action-threads-panel = Show Threads Panel
+zen-action-threads-shelve = Shelve This Page
+zen-action-threads-journal = Open Journal
