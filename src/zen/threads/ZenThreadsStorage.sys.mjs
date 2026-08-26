@@ -513,6 +513,29 @@ export const ZenThreadsStorage = new (class {
     });
   }
 
+  /** Undo a shelving: the most recent unresolved entry for this page. */
+  unshelveUrl(url) {
+    this.#shelfRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `DELETE FROM shelf WHERE id = (
+             SELECT id FROM shelf
+             WHERE url = :url AND resolved_ts IS NULL
+             ORDER BY ts DESC LIMIT 1
+           )`,
+          { url }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: unshelveUrl failed", e);
+      }
+    });
+  }
+
   async getShelf(limit = 30) {
     // Capture the revision before awaiting: a write landing during the await
     // must not let us stamp stale rows as current.
@@ -857,12 +880,12 @@ export const ZenThreadsStorage = new (class {
     try {
       rows = first
         ? await this.#db.execute(
-            `SELECT id, ts, kind, tab, parent, url, title, search_query
+            `SELECT id, ts, kind, tab, parent, url, title, search_query, dwell_ms
              FROM events WHERE ts > :cutoff ORDER BY id ASC`,
             { cutoff: Date.now() - retentionWindowMs() }
           )
         : await this.#db.executeCached(
-            `SELECT id, ts, kind, tab, parent, url, title, search_query
+            `SELECT id, ts, kind, tab, parent, url, title, search_query, dwell_ms
              FROM events WHERE id > :sinceId ORDER BY id ASC`,
             { sinceId: this.#maxEventId }
           );
@@ -915,7 +938,11 @@ export const ZenThreadsStorage = new (class {
       const url = row.getResultByName("url");
       const title = row.getResultByName("title");
       if (kind === "dwell") {
-        node.dwellMs += row.getResultByName("dwell_ms") ?? 0;
+        try {
+          node.dwellMs += row.getResultByName("dwell_ms") ?? 0;
+        } catch (e) {
+          // Row predates the column; no attention recorded for it.
+        }
         continue;
       }
       switch (kind) {

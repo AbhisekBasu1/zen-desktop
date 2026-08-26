@@ -1196,7 +1196,30 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     return out;
   }
 
+  #countReferences(nodes, liveTabs) {
+    let count = 0;
+    for (const node of nodes) {
+      if (node.isReference && liveTabs.has(node.key)) {
+        count++;
+      }
+      if (node.children.length) {
+        count += this.#countReferences(node.children, liveTabs);
+      }
+    }
+    return count;
+  }
+
   #forgetThread(thread, liveTabs) {
+    // The only action here with no inverse, so it is the only one that asks.
+    const ok = Services.prompt.confirm(
+      window,
+      "Forget this thread?",
+      `“${thread.title}” and everything recorded in it will be permanently ` +
+        `deleted. This cannot be undone.`
+    );
+    if (!ok) {
+      return;
+    }
     const keys = this.#collectKeys(thread.roots);
     const tabs = [];
     this.#collectLiveTabs(thread.roots, liveTabs, tabs, {
@@ -1210,6 +1233,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       }
     }
     ZenThreadsStorage.forgetThread(thread.id, keys);
+    this.#toast("Thread forgotten");
     this.#queueSidebarRefresh();
     setTimeout(() => this.#render().catch(() => {}), 150);
   }
@@ -1262,9 +1286,22 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         return false; // let the native Save dialog handle non-web pages
       }
       const key = this.#tabKeys.get(tab) ?? null;
-      ZenThreadsStorage.shelvePage(uri.spec, tab.label, key);
+      const url = uri.spec;
+      ZenThreadsStorage.shelvePage(url, tab.label, key);
       if (gBrowser.tabs.length > 1) {
         gBrowser.removeTab(tab, { animate: true });
+        this.#toast(`Shelved “${tab.label || url}”`, () => {
+          ZenThreadsStorage.unshelveUrl(url);
+          try {
+            lazy.SessionStore.undoCloseTab(window, 0);
+          } catch (e) {
+            gBrowser.selectedTab = gBrowser.addTab(url, {
+              triggeringPrincipal:
+                Services.scriptSecurityManager.getSystemPrincipal(),
+            });
+          }
+          this.#queueSidebarRefresh();
+        });
       } else {
         gBrowser.selectedBrowser.fixupAndLoadURIString("about:newtab", {
           triggeringPrincipal:
@@ -2061,6 +2098,94 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
   }
 
+  /**
+   * Every thread action, reachable without hovering and without knowing a
+   * keyboard shortcut.
+   */
+  #openContextMenu(event, thread, compareSet, liveTabs) {
+    const menu = document.getElementById("zen-threads-context-menu");
+    if (!menu) {
+      return;
+    }
+    const bind = (id, enabled, handler) => {
+      const item = document.getElementById(id);
+      if (!item) {
+        return;
+      }
+      item.hidden = !enabled;
+      item.oncommand = enabled ? handler : null;
+    };
+
+    const hasFolder = this.#folderMap.has(thread.id);
+    const liveThreadTabs = [];
+    this.#collectLiveTabs(thread.roots, liveTabs, liveThreadTabs);
+
+    bind("zen-threads-ctx-open", true, () => {
+      this.#expandedSidebarThreads.add(thread.id);
+      this.#refreshSidebar(thread.id).catch(() => {});
+    });
+    bind("zen-threads-ctx-rename", true, () => {
+      this.togglePanel();
+      setTimeout(() => this.#render().catch(() => {}), 60);
+    });
+    bind(
+      "zen-threads-ctx-group",
+      !hasFolder && liveThreadTabs.length >= 2 && typeof gZenFolders !== "undefined",
+      () => this.#groupThread(thread, liveThreadTabs)
+    );
+    bind("zen-threads-ctx-compare", !!compareSet, () =>
+      this.#openCompare(thread, compareSet, liveTabs)
+    );
+    bind("zen-threads-ctx-merge", true, () => {
+      this.#mergeSource = thread.id;
+      this.#toast("Pick another thread to merge into");
+      this.#refreshSidebar().catch(() => {});
+    });
+    bind("zen-threads-ctx-unmerge", true, () => {
+      ZenThreadsStorage.unlinkThread(thread.id);
+      this.#queueSidebarRefresh();
+    });
+    bind("zen-threads-ctx-export", true, () =>
+      this.#exportThread(thread).catch(e =>
+        console.error("ZenThreads: export failed", e)
+      )
+    );
+    bind("zen-threads-ctx-done", true, () => {
+      const out = [];
+      this.#collectLiveTabs(thread.roots, liveTabs, out, {
+        includePinned: true,
+        skipReferences: true,
+      });
+      ZenThreadsStorage.setThreadStatus(thread.id, "done");
+      let closed = 0;
+      for (const tab of out) {
+        try {
+          gBrowser.removeTab(tab, { animate: true });
+          closed++;
+        } catch (e) {
+          // Already gone.
+        }
+      }
+      this.#toast(`Thread archived · ${closed} tabs closed`, () => {
+        ZenThreadsStorage.setThreadStatus(thread.id, null);
+        for (let i = 0; i < closed; i++) {
+          try {
+            lazy.SessionStore.undoCloseTab(window, 0);
+          } catch (e) {
+            break;
+          }
+        }
+        this.#queueSidebarRefresh();
+      });
+      this.#queueSidebarRefresh();
+    });
+    bind("zen-threads-ctx-forget", true, () =>
+      this.#forgetThread(thread, liveTabs)
+    );
+
+    menu.openPopupAtScreen(event.screenX, event.screenY, true);
+  }
+
   #onSidebarKeydown(event) {
     const rows = this.#sidebarRows();
     if (!rows.length) {
@@ -2275,8 +2400,13 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         } else if (this.#mergeSource === thread.id) {
           this.#mergeSource = null;
         } else {
-          ZenThreadsStorage.linkThreads(thread.id, this.#mergeSource);
+          const merged = this.#mergeSource;
+          ZenThreadsStorage.linkThreads(thread.id, merged);
           this.#mergeSource = null;
+          this.#toast("Threads merged", () => {
+            ZenThreadsStorage.unlinkThread(merged);
+            this.#queueSidebarRefresh();
+          });
         }
         this.#refreshSidebar().catch(() => {});
       });
@@ -2316,13 +2446,32 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
           includePinned: true,
           skipReferences: true,
         });
+        let closed = 0;
         for (const t of out) {
           try {
             gBrowser.removeTab(t, { animate: true });
+            closed++;
           } catch (err) {
             // Tab already gone.
           }
         }
+        const keptRefs = this.#countReferences(thread.roots, liveTabs);
+        this.#toast(
+          keptRefs
+            ? `Thread archived · ${closed} closed, ${keptRefs} references kept`
+            : `Thread archived · ${closed} tabs closed`,
+          () => {
+            ZenThreadsStorage.setThreadStatus(thread.id, null);
+            for (let i = 0; i < closed; i++) {
+              try {
+                lazy.SessionStore.undoCloseTab(window, 0);
+              } catch (err) {
+                break;
+              }
+            }
+            this.#queueSidebarRefresh();
+          }
+        );
         this.#queueSidebarRefresh();
       });
       row.appendChild(done);
