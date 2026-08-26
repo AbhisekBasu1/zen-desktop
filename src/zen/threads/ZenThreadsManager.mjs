@@ -20,6 +20,21 @@ ChromeUtils.defineESModuleGetters(lazy, {
 // elements whose text content does not render. Always create HTML elements.
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 
+// Strings come from browser/zen-threads.ftl. The English text stays inline as
+// a fallback so a missing or not-yet-translated id degrades to readable text
+// rather than an empty label.
+let gStrings = null;
+function ftl(id, fallback, args = null) {
+  try {
+    if (!gStrings) {
+      gStrings = new Localization(["browser/zen-threads.ftl"], true);
+    }
+    return gStrings.formatValueSync(id, args) || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
 // SessionStore custom value carrying a tab's stable thread key, so trails
 // survive session restore.
 const TAB_KEY_PROP = "zenThreadKey";
@@ -518,7 +533,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (!threads.length && !loose.length && !shelf.length) {
       const empty = document.createElementNS(XHTML_NS, "div");
       empty.className = "zen-threads-empty";
-      empty.textContent = "No trails yet — browse a little.";
+      empty.textContent = ftl(
+        "zen-threads-panel-empty",
+        "No trails yet — browse a little."
+      );
       content.appendChild(empty);
       return;
     }
@@ -587,7 +605,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       section.className = "zen-thread-section";
       const header = document.createElementNS(XHTML_NS, "div");
       header.className = "zen-thread-header zen-thread-loose-header";
-      header.textContent = "Loose tabs";
+      header.textContent = ftl("zen-threads-loose-tabs", "Loose tabs");
       section.appendChild(header);
       const body = document.createElementNS(XHTML_NS, "div");
       body.className = "zen-thread-body";
@@ -597,6 +615,67 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       section.appendChild(body);
       content.appendChild(section);
     }
+  }
+
+  /**
+   * Focus a tab wherever it lives: another window, or another Zen space —
+   * a thread's tabs are not confined to the space you happen to be in.
+   */
+  #activateTab(entry) {
+    try {
+      entry.win.focus();
+      const workspaceId = entry.tab
+        .closest?.("[zen-workspace-id]")
+        ?.getAttribute("zen-workspace-id");
+      const spaces = entry.win.gZenWorkspaces;
+      if (
+        workspaceId &&
+        spaces?.activeWorkspace &&
+        spaces.activeWorkspace !== workspaceId &&
+        typeof spaces.changeWorkspaceWithID === "function"
+      ) {
+        spaces.changeWorkspaceWithID(workspaceId);
+      }
+      entry.win.gBrowser.selectedTab = entry.tab;
+    } catch (e) {
+      try {
+        entry.win.gBrowser.selectedTab = entry.tab;
+      } catch (err) {
+        console.error("ZenThreads: could not focus tab", err);
+      }
+    }
+  }
+
+  /** Per-page corrections: take this page out of the thread it joined. */
+  #openNodeMenu(event, node) {
+    const menu = document.getElementById("zen-threads-node-menu");
+    if (!menu) {
+      return;
+    }
+    const detach = document.getElementById("zen-threads-node-detach");
+    const reattach = document.getElementById("zen-threads-node-reattach");
+    if (detach) {
+      detach.hidden = !!node.isDetached;
+      detach.oncommand = () => {
+        ZenThreadsStorage.detachNode(node.key);
+        this.#toast("Moved out of this thread", () => {
+          ZenThreadsStorage.reattachNode(node.key);
+          this.#queueSidebarRefresh();
+          this.#render().catch(() => {});
+        });
+        this.#queueSidebarRefresh();
+        setTimeout(() => this.#render().catch(() => {}), 120);
+      };
+    }
+    if (reattach) {
+      reattach.hidden = !node.isDetached;
+      reattach.oncommand = () => {
+        ZenThreadsStorage.reattachNode(node.key);
+        this.#queueSidebarRefresh();
+        setTimeout(() => this.#render().catch(() => {}), 120);
+      };
+    }
+    menu.openPopupAtScreen(event.screenX, event.screenY, true);
   }
 
   #buildLiveMap() {
@@ -656,7 +735,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     header.className = "zen-thread-header";
     const title = document.createElementNS(XHTML_NS, "span");
     title.className = "zen-thread-title";
-    title.textContent = "Shelf";
+    title.textContent = ftl("zen-threads-shelf-label", "Shelf");
     header.appendChild(title);
     const meta = document.createElementNS(XHTML_NS, "span");
     meta.className = "zen-thread-meta";
@@ -728,7 +807,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       if (item.belongsHere) {
         const badge = document.createElementNS(XHTML_NS, "span");
         badge.className = "zen-shelf-affinity";
-        badge.textContent = "this thread";
+        badge.textContent = ftl("zen-threads-shelf-affinity", "this thread");
         row.appendChild(badge);
       }
       const dismiss = document.createElementNS(XHTML_NS, "button");
@@ -866,8 +945,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     done.className = "zen-thread-done-btn";
     done.textContent = thread.done ? "↺" : "✓";
     done.title = thread.done
-      ? "Restore this thread"
-      : "Done — archive thread and close its tabs";
+      ? ftl("zen-threads-action-restore", "Restore this thread")
+      : ftl(
+          "zen-threads-action-done",
+          "Done — archive this thread and close its tabs"
+        );
     done.addEventListener("click", e => {
       e.stopPropagation();
       if (thread.done) {
@@ -1041,7 +1123,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (node.isReference) {
       const badge = document.createElementNS(XHTML_NS, "span");
       badge.className = "zen-thread-reference-badge";
-      badge.textContent = "reference";
+      badge.textContent = ftl("zen-threads-reference-badge", "reference");
       badge.title = "You return to this across different work — kept when a thread is done";
       row.appendChild(badge);
     }
@@ -1059,11 +1141,15 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
     row.addEventListener("click", () => {
       if (entry) {
-        entry.win.focus();
-        entry.win.gBrowser.selectedTab = entry.tab;
+        this.#activateTab(entry);
       } else if (node.url) {
         this.#reopen(node);
       }
+    });
+    row.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.#openNodeMenu(e, node);
     });
     container.appendChild(row);
 
@@ -1350,7 +1436,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     header.className = "ztc-header";
     const heading = document.createElementNS(XHTML_NS, "div");
     heading.className = "ztc-heading";
-    heading.textContent = "Journal";
+    heading.textContent = ftl("zen-threads-journal-title", "Journal");
     header.appendChild(heading);
     const close = document.createElementNS(XHTML_NS, "button");
     close.className = "ztc-close";
@@ -1415,7 +1501,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
         const resume = document.createElementNS(XHTML_NS, "button");
         resume.className = "ztc-open";
-        resume.textContent = "Resume";
+        resume.textContent = ftl("zen-threads-journal-resume", "Resume");
         resume.addEventListener("click", () => {
           const thread = threadById.get(block.threadId);
           this.#closeCompare();
@@ -1512,8 +1598,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     }
 
     if (target.entry) {
-      target.entry.win.focus();
-      target.entry.win.gBrowser.selectedTab = target.entry.tab;
+      this.#activateTab(target.entry);
     } else {
       this.#reopen(target.node);
     }
@@ -1525,10 +1610,10 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     today.setHours(0, 0, 0, 0);
     const diffDays = Math.round((today.getTime() - dayStart) / 86400000);
     if (diffDays === 0) {
-      return "Today";
+      return ftl("zen-threads-journal-today", "Today");
     }
     if (diffDays === 1) {
-      return "Yesterday";
+      return ftl("zen-threads-journal-yesterday", "Yesterday");
     }
     const date = new Date(dayStart);
     if (diffDays < 7) {
@@ -1650,12 +1735,16 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
       const state = document.createElementNS(XHTML_NS, "div");
       state.className = "ztc-state";
-      state.textContent = entry ? "open" : "closed";
+      state.textContent = entry
+        ? ftl("zen-threads-compare-open", "open")
+        : ftl("zen-threads-compare-closed", "closed");
       card.appendChild(state);
 
       const open = document.createElementNS(XHTML_NS, "button");
       open.className = "ztc-open";
-      open.textContent = entry ? "Go to tab" : "Reopen";
+      open.textContent = entry
+        ? ftl("zen-threads-compare-goto", "Go to tab")
+        : ftl("zen-threads-compare-reopen", "Reopen");
       open.addEventListener("click", e => {
         e.stopPropagation();
         this.#closeCompare();
@@ -1663,8 +1752,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
         // to have been closed or moved to another window.
         const current = this.#buildLiveMap().get(node.key);
         if (current && !current.win.closed) {
-          current.win.focus();
-          current.win.gBrowser.selectedTab = current.tab;
+          this.#activateTab(current);
         } else {
           this.#reopen(node);
         }
@@ -1673,8 +1761,11 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
 
       const keep = document.createElementNS(XHTML_NS, "button");
       keep.className = "ztc-keep";
-      keep.textContent = "Keep this one";
-      keep.title = "Record this as the decision and shelve the rest";
+      keep.textContent = ftl("zen-threads-compare-keep", "Keep this one");
+      keep.title = ftl(
+        "zen-threads-compare-keep-tooltip",
+        "Record this as the decision and shelve the rest"
+      );
       keep.addEventListener("click", e => {
         e.stopPropagation();
         this.#keepCandidate(thread, set, node, liveTabs);
@@ -1736,8 +1827,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
       this.#closeCompare();
       const entry = liveTabs.get(chosen.key);
       if (entry) {
-        entry.win.focus();
-        entry.win.gBrowser.selectedTab = entry.tab;
+        this.#activateTab(entry);
       } else {
         this.#reopen(chosen);
       }
@@ -1768,7 +1858,7 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     if (undo) {
       const button = document.createElementNS(XHTML_NS, "button");
       button.className = "zen-threads-toast-undo";
-      button.textContent = "Undo";
+      button.textContent = ftl("zen-threads-toast-undo", "Undo");
       button.addEventListener("click", () => {
         undo();
         host.hidden = true;
@@ -2293,12 +2383,15 @@ class nsZenThreadsManager extends nsZenDOMOperatedFeature {
     const header = document.createElementNS(XHTML_NS, "div");
     header.className = "zen-ts-header";
     const headerLabel = document.createElementNS(XHTML_NS, "span");
-    headerLabel.textContent = "Threads";
+    headerLabel.textContent = ftl("zen-threads-sidebar-label", "Threads");
     header.appendChild(headerLabel);
     const journalBtn = document.createElementNS(XHTML_NS, "button");
     journalBtn.className = "zen-ts-journal-btn";
-    journalBtn.textContent = "Journal";
-    journalBtn.title = "Journal — your browsing as sessions of work";
+    journalBtn.textContent = ftl("zen-threads-journal-button", "Journal");
+    journalBtn.title = ftl(
+        "zen-threads-journal-tooltip",
+        "Journal — your browsing as sessions of work"
+      );
     journalBtn.addEventListener("click", () =>
       this.#openJournal().catch(e =>
         console.error("ZenThreads: journal failed", e)

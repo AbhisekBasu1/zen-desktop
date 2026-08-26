@@ -182,6 +182,13 @@ export const ZenThreadsStorage = new (class {
         )
       `);
       await db.execute(`
+        CREATE TABLE IF NOT EXISTS node_overrides (
+          tab_key TEXT PRIMARY KEY,
+          detached INTEGER NOT NULL DEFAULT 0,
+          ts INTEGER NOT NULL
+        )
+      `);
+      await db.execute(`
         CREATE TABLE IF NOT EXISTS thread_links (
           a TEXT NOT NULL,
           b TEXT NOT NULL,
@@ -673,6 +680,63 @@ export const ZenThreadsStorage = new (class {
     });
   }
 
+  /** Pull a page out of its thread; its subtree comes with it. */
+  detachNode(tabKey) {
+    this.#linkRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          `INSERT INTO node_overrides (tab_key, detached, ts)
+           VALUES (:key, 1, :ts)
+           ON CONFLICT(tab_key) DO UPDATE SET detached = 1, ts = :ts`,
+          { key: tabKey, ts: Date.now() }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: detachNode failed", e);
+      }
+    });
+  }
+
+  reattachNode(tabKey) {
+    this.#linkRev++;
+    this.#writeQueue = this.#writeQueue.then(async () => {
+      await this.#dbReady;
+      if (!this.#db) {
+        return;
+      }
+      try {
+        await this.#db.execute(
+          "DELETE FROM node_overrides WHERE tab_key = :key",
+          { key: tabKey }
+        );
+      } catch (e) {
+        console.error("ZenThreadsStorage: reattachNode failed", e);
+      }
+    });
+  }
+
+  async #getDetached() {
+    const set = new Set();
+    if (!this.#db) {
+      return set;
+    }
+    try {
+      const rows = await this.#db.executeCached(
+        "SELECT tab_key FROM node_overrides WHERE detached = 1"
+      );
+      for (const row of rows) {
+        set.add(row.getResultByName("tab_key"));
+      }
+    } catch (e) {
+      console.error("ZenThreadsStorage: getDetached failed", e);
+    }
+    return set;
+  }
+
   unlinkThread(threadId) {
     this.#linkRev++;
     this.#writeQueue = this.#writeQueue.then(async () => {
@@ -816,7 +880,10 @@ export const ZenThreadsStorage = new (class {
     if (this.#graphCache?.key === graphKey) {
       graph = this.#graphCache.value;
     } else {
-      graph = this.#deriveGraph(await this.#getThreadLinks());
+      graph = this.#deriveGraph(
+        await this.#getThreadLinks(),
+        await this.#getDetached()
+      );
       this.#graphCache = { key: graphKey, value: graph };
     }
 
@@ -1016,7 +1083,7 @@ export const ZenThreadsStorage = new (class {
    * fresh node objects, so it can be re-run any number of times without
    * corrupting the fold. Returns { shells, loose, nodeThread }.
    */
-  #deriveGraph(links) {
+  #deriveGraph(links, detached = new Set()) {
     const nodes = new Map();
     for (const [key, folded] of this.#nodes) {
       nodes.set(key, { ...folded, children: [] });
@@ -1042,8 +1109,9 @@ export const ZenThreadsStorage = new (class {
     // Link children; find each node's component root. App nodes neither
     // parent nor join anything.
     for (const node of nodes.values()) {
-      if (node.isApp) {
+      if (node.isApp || detached.has(node.key)) {
         node.parent = null;
+        node.isDetached = detached.has(node.key);
         continue;
       }
       if (
